@@ -42,6 +42,9 @@ from src.editorial.services.telegram_resilience import (
 from src.editorial.utils.text import clean_text
 
 
+TELEGRAM_MEDIA_CAPTION_MAX_LENGTH = 1024
+
+
 @dataclass(slots=True)
 class PublisherRunResult:
     attempted: int = 0
@@ -313,6 +316,23 @@ class PublisherService:
                     raise ValueError("Media group submission has no source chat or message ids")
                 raise ValueError("Media group submission has incomplete source message ids")
             source_text = self._get_related_submission_source_text(related_rows)
+            formatted_caption = self.format_publication_text(
+                source_text,
+                channel,
+                submission,
+                channel_signature=channel_signature,
+                channel_title=channel_title,
+                add_channel_signature=add_channel_signature,
+            )
+            caption_too_long = len(formatted_caption) > TELEGRAM_MEDIA_CAPTION_MAX_LENGTH
+            if caption_too_long:
+                logger.warning(
+                    "Will preserve the original caption for media group content item {}: "
+                    "formatted caption length {} exceeds Telegram limit {}",
+                    content_item.id,
+                    len(formatted_caption),
+                    TELEGRAM_MEDIA_CAPTION_MAX_LENGTH,
+                )
             copied_message_ids = await self.telegram_adapter.copy_messages(
                 bot_token=bot_token,
                 channel_id=channel.tg_channel_id,
@@ -322,15 +342,7 @@ class PublisherService:
             if not copied_message_ids:
                 raise RuntimeError("Telegram returned no copied media group messages")
 
-            formatted_caption = self.format_publication_text(
-                source_text,
-                channel,
-                submission,
-                channel_signature=channel_signature,
-                channel_title=channel_title,
-                add_channel_signature=add_channel_signature,
-            )
-            if formatted_caption != source_text:
+            if formatted_caption != source_text and not caption_too_long:
                 caption_index = next(
                     (
                         index for index, item in enumerate(related_rows)
@@ -339,13 +351,23 @@ class PublisherService:
                     0,
                 )
                 caption_index = min(caption_index, len(copied_message_ids) - 1)
-                await self.telegram_adapter.edit_message_caption(
-                    bot_token=bot_token,
-                    channel_id=channel.tg_channel_id,
-                    message_id=copied_message_ids[caption_index],
-                    caption=formatted_caption,
-                    parse_mode=parse_mode,
-                )
+                try:
+                    await self.telegram_adapter.edit_message_caption(
+                        bot_token=bot_token,
+                        channel_id=channel.tg_channel_id,
+                        message_id=copied_message_ids[caption_index],
+                        caption=formatted_caption,
+                        parse_mode=parse_mode,
+                    )
+                except Exception as ex:
+                    # copyMessages has already created the album in Telegram. Retrying
+                    # the publication after a caption-only failure would duplicate it.
+                    logger.error(
+                        "Copied media group content item {}, but failed to update its caption; "
+                        "treating the copy as sent to prevent duplicate publication: {}",
+                        content_item.id,
+                        ex,
+                    )
             return copied_message_ids[0]
 
         if submission.content_type in {"photo", "video", "animation"}:
@@ -637,7 +659,8 @@ class PublisherService:
                 log_item.publish_status = PublicationStatus.FAILED
                 log_item.retry_after = None
                 log_item.error_text = str(ex)[:4000]
-                content_item.status = ContentItemStatus.APPROVED
+                content_item.status = ContentItemStatus.HOLD
+                content_item.scheduled_for = None
                 result.failed += 1
 
             await session.commit()

@@ -528,6 +528,7 @@ class SchedulerService:
             .where(
                 ContentItem.channel_id == channel.id,
                 ContentItem.status == ContentItemStatus.APPROVED,
+                ContentItem.scheduled_for.is_(None),
                 (ContentItem.publish_after.is_(None) | (ContentItem.publish_after <= slot_dt)),
                 (ContentItem.expires_at.is_(None) | (ContentItem.expires_at > slot_dt)),
             )

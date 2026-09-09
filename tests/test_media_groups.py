@@ -244,6 +244,94 @@ async def test_slot_publisher_uses_original_album_when_review_rows_share_control
 
 
 @pytest.mark.asyncio
+async def test_slot_publisher_preserves_original_album_caption_when_formatted_caption_is_too_long() -> None:
+    long_caption = "x" * 1100
+    submission = SimpleNamespace(
+        id=1,
+        channel_id=7,
+        media_group_id="album-1",
+        source_chat_id=1001,
+        source_message_id=11,
+        cleaned_text=long_caption,
+        raw_text=long_caption,
+        is_anonymous=True,
+        username=None,
+    )
+    related_rows = [submission]
+    legacy_rows = [SimpleNamespace(review_chat_id=-10055, review_message_id=503)]
+    result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: related_rows))
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=submission),
+        execute=AsyncMock(return_value=result),
+    )
+    adapter = SimpleNamespace(
+        copy_messages=AsyncMock(return_value=[701]),
+        edit_message_caption=AsyncMock(),
+    )
+    service = PublisherService(telegram_adapter=adapter)
+    service.should_add_channel_signature = AsyncMock(return_value=True)
+    service.resolve_channel_publication_signature = AsyncMock(
+        return_value=SimpleNamespace(ref="@channel", title="Channel")
+    )
+    service._get_related_legacy_rows = AsyncMock(return_value=legacy_rows)
+    channel = SimpleNamespace(id=7, tg_channel_id=-10077, short_code="channel", title="Channel")
+    content_item = SimpleNamespace(id=42, origin_submission_id=1)
+
+    published_id = await service._publish_submission_based_item(
+        session,
+        content_item,
+        channel,
+        "1:test",
+    )
+
+    assert published_id == 701
+    adapter.copy_messages.assert_awaited_once()
+    adapter.edit_message_caption.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_publisher_does_not_retry_album_after_caption_edit_failure() -> None:
+    submission = SimpleNamespace(
+        id=1,
+        channel_id=7,
+        media_group_id="album-1",
+        source_chat_id=1001,
+        source_message_id=11,
+        cleaned_text="Album caption",
+        raw_text="Album caption",
+        is_anonymous=False,
+        username="author",
+    )
+    related_rows = [submission]
+    legacy_rows = [SimpleNamespace(review_chat_id=-10055, review_message_id=503)]
+    result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: related_rows))
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=submission),
+        execute=AsyncMock(return_value=result),
+    )
+    adapter = SimpleNamespace(
+        copy_messages=AsyncMock(return_value=[701]),
+        edit_message_caption=AsyncMock(side_effect=RuntimeError("caption update failed")),
+    )
+    service = PublisherService(telegram_adapter=adapter)
+    service.should_add_channel_signature = AsyncMock(return_value=False)
+    service._get_related_legacy_rows = AsyncMock(return_value=legacy_rows)
+    channel = SimpleNamespace(id=7, tg_channel_id=-10077, short_code="channel", title="Channel")
+    content_item = SimpleNamespace(id=42, origin_submission_id=1)
+
+    published_id = await service._publish_submission_based_item(
+        session,
+        content_item,
+        channel,
+        "1:test",
+    )
+
+    assert published_id == 701
+    adapter.copy_messages.assert_awaited_once()
+    adapter.edit_message_caption.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_panel_album_preview_uses_one_media_group_fallback() -> None:
     preview = SimpleNamespace(
         media_group_id="album-1",

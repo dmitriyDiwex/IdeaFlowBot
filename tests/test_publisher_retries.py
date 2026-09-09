@@ -155,3 +155,41 @@ async def test_successful_retry_marks_message_sent(monkeypatch) -> None:
     assert item.status == ContentItemStatus.PUBLISHED
     status_sync.mark_content_item_published.assert_awaited_once_with(item.id)
     status_sync.reconcile_published_review_statuses.assert_awaited_once_with(limit=20)
+
+
+@pytest.mark.asyncio
+async def test_permanent_error_moves_message_to_hold() -> None:
+    now = datetime(2026, 9, 9, 16, 55, tzinfo=timezone.utc)
+    log_item, item, channel = _publication_objects(now)
+    session = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[log_item, None]),
+        get=AsyncMock(side_effect=[item, channel]),
+        commit=AsyncMock(),
+    )
+    legacy_reader = SimpleNamespace(
+        get_bot_binding=AsyncMock(return_value=SimpleNamespace(bot_api_token="1:token"))
+    )
+    status_sync = SimpleNamespace(
+        mark_content_item_published=AsyncMock(return_value=0),
+        reconcile_published_review_statuses=AsyncMock(return_value=0),
+    )
+    service = PublisherService(
+        telegram_adapter=SimpleNamespace(),
+        legacy_reader=legacy_reader,
+        legacy_publication_status=status_sync,
+    )
+    service._publish_submission_based_item = AsyncMock(
+        side_effect=RuntimeError("Bad Request: MEDIA_CAPTION_TOO_LONG")
+    )
+
+    result = await service.run(session, now=now, limit=1)
+
+    assert result.attempted == 1
+    assert result.sent == 0
+    assert result.failed == 1
+    assert log_item.publish_status == PublicationStatus.FAILED
+    assert log_item.retry_after is None
+    assert "MEDIA_CAPTION_TOO_LONG" in log_item.error_text
+    assert item.status == ContentItemStatus.HOLD
+    assert item.scheduled_for is None
+    status_sync.mark_content_item_published.assert_not_awaited()
