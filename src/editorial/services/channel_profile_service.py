@@ -35,6 +35,19 @@ PROFILE_SETTING_FIELDS = [
     "allow_pastes",
 ]
 
+AUTO_SLOT_REPLAN_FIELDS = {
+    "min_gap_minutes",
+    "auto_slots_enabled",
+    "auto_slots_plan_time",
+    "auto_slots_window_start",
+    "auto_slots_window_end",
+    "auto_slots_replace_manual",
+    "min_slots_per_day",
+    "max_posts_per_day",
+    "max_paste_per_day",
+    "allow_pastes",
+}
+
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 SUBSCRIBER_SNAPSHOT_RETENTION_DAYS = 14
 
@@ -392,10 +405,18 @@ class ChannelProfileService:
         profile: ChannelSettingProfile,
         applied_at: datetime | None = None,
     ) -> None:
+        requires_slot_replan = any(
+            field_name in AUTO_SLOT_REPLAN_FIELDS
+            and (profile_value := getattr(profile, field_name)) is not None
+            and getattr(channel, field_name) != profile_value
+            for field_name in PROFILE_SETTING_FIELDS
+        )
         for field_name in PROFILE_SETTING_FIELDS:
             profile_value: Any = getattr(profile, field_name)
             if profile_value is not None:
                 setattr(channel, field_name, profile_value)
+        if requires_slot_replan:
+            channel.auto_slots_last_planned_for = None
         channel.settings_profile_id = profile.id
         channel.settings_profile_applied_at = applied_at or datetime.now(timezone.utc)
 

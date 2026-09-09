@@ -78,11 +78,15 @@ class AutoSlotPlannerService:
 
     def _target_date_for_channel(self, channel: Channel, now: datetime) -> date | None:
         local_now = now.astimezone(ZoneInfo(channel.timezone))
-        local_today = local_now.date()
+        if local_now.time() < channel.auto_slots_plan_time:
+            return None
 
-        if local_now.time() >= channel.auto_slots_plan_time:
-            if channel.auto_slots_last_planned_for != local_today:
-                return local_today
+        target_date = local_now.date()
+        if local_now.time() >= channel.auto_slots_window_end:
+            target_date += timedelta(days=1)
+
+        if channel.auto_slots_last_planned_for != target_date:
+            return target_date
 
         return None
 

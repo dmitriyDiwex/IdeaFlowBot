@@ -79,12 +79,46 @@ def test_spread_slot_times_caps_count_by_min_gap() -> None:
     assert slot_times == [time(10, 0), time(11, 0), time(12, 0)]
 
 
-def test_target_date_uses_current_day_after_plan_time() -> None:
+def test_target_date_uses_next_day_when_plan_time_is_after_window() -> None:
     service = AutoSlotPlannerService()
     channel = _channel(auto_slots_last_planned_for=None)
     now = datetime(2026, 7, 30, 20, 31, tzinfo=timezone.utc)
 
+    assert service._target_date_for_channel(channel, now) == date(2026, 7, 31)
+
+
+def test_target_date_uses_current_day_when_run_is_before_window_end() -> None:
+    service = AutoSlotPlannerService()
+    channel = _channel(
+        auto_slots_plan_time=time(5, 30),
+        auto_slots_window_start=time(8, 0),
+        auto_slots_window_end=time(23, 0),
+        auto_slots_last_planned_for=None,
+    )
+    now = datetime(2026, 7, 30, 3, 0, tzinfo=timezone.utc)
+
     assert service._target_date_for_channel(channel, now) == date(2026, 7, 30)
+
+
+def test_target_date_uses_next_day_when_a_normal_run_was_delayed_past_window() -> None:
+    service = AutoSlotPlannerService()
+    channel = _channel(
+        auto_slots_plan_time=time(5, 30),
+        auto_slots_window_start=time(8, 0),
+        auto_slots_window_end=time(22, 0),
+        auto_slots_last_planned_for=None,
+    )
+    now = datetime(2026, 7, 30, 20, 0, tzinfo=timezone.utc)
+
+    assert service._target_date_for_channel(channel, now) == date(2026, 7, 31)
+
+
+def test_target_date_skips_next_day_when_it_is_already_planned() -> None:
+    service = AutoSlotPlannerService()
+    channel = _channel(auto_slots_last_planned_for=date(2026, 7, 31))
+    now = datetime(2026, 7, 30, 20, 31, tzinfo=timezone.utc)
+
+    assert service._target_date_for_channel(channel, now) is None
 
 
 def test_target_date_waits_until_plan_time_for_current_day() -> None:

@@ -1,7 +1,7 @@
-from datetime import datetime, time, timezone
+from datetime import date, datetime, time, timezone
 
 from src.editorial.models.channel import Channel, ChannelSettingProfile
-from src.editorial.services.channel_profile_service import ChannelProfileService
+from src.editorial.services.channel_profile_service import AUTO_SLOT_REPLAN_FIELDS, ChannelProfileService
 
 
 def _profile(slug: str, min_subscribers: int, max_subscribers: int | None, **overrides) -> ChannelSettingProfile:
@@ -86,6 +86,36 @@ def test_apply_profile_keeps_channel_timezone() -> None:
     ChannelProfileService._apply_profile(channel, profile)
 
     assert channel.timezone == "Asia/Yekaterinburg"
+
+
+def test_apply_profile_resets_planned_date_when_slot_policy_changes() -> None:
+    channel = Channel(
+        tg_channel_id=1,
+        short_code="test",
+        timezone="Europe/Moscow",
+        min_slots_per_day=3,
+        auto_slots_last_planned_for=date(2026, 9, 10),
+    )
+    profile = _profile("growing", 50, 999, id=42, min_slots_per_day=5)
+
+    ChannelProfileService._apply_profile(channel, profile)
+
+    assert channel.auto_slots_last_planned_for is None
+
+
+def test_apply_profile_preserves_planned_date_when_slot_policy_is_unchanged() -> None:
+    profile = _profile("growing", 50, 999, id=42, min_slots_per_day=5)
+    channel = Channel(
+        tg_channel_id=1,
+        short_code="test",
+        timezone="Europe/Moscow",
+        auto_slots_last_planned_for=date(2026, 9, 10),
+        **{field_name: getattr(profile, field_name) for field_name in AUTO_SLOT_REPLAN_FIELDS},
+    )
+
+    ChannelProfileService._apply_profile(channel, profile)
+
+    assert channel.auto_slots_last_planned_for == date(2026, 9, 10)
 
 
 def test_profile_settings_match_detects_changed_profile_values() -> None:
