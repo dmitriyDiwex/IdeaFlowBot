@@ -14,7 +14,9 @@ from src.core_database.database import (CrudChatAdmins, CrudBannedUser,
                                         CrudServiceMessage,
                                         CrudUserData, CrudDelayedPosts,
                                         CrudAnonymMessage, CrudAdvertising)
+from src.editorial.db.session import session_factory
 from src.editorial.models.enums import SubmissionStatus
+from src.editorial.services.ad_link_exclusion_service import AdLinkExclusionService
 from src.editorial.services.legacy_moderation_sync import LegacyModerationSyncService
 from src.editorial.services.legacy_publication_guard import LegacyPublicationGuard
 from src.editorial.services.publication_signature import (
@@ -80,6 +82,7 @@ class SubBot:
         self.advertising_database = CrudAdvertising()
         self.legacy_moderation_sync = LegacyModerationSyncService()
         self.publication_guard = LegacyPublicationGuard()
+        self.ad_link_exclusion_service = AdLinkExclusionService()
 
         self.token = api_token_bot
         self.channel_username = channel_username
@@ -518,7 +521,21 @@ class SubBot:
             content_types=['text', 'photo', 'video', 'animation', 'document', 'audio']
         )
         async def snipe_post(message: Message) -> None:
-            check_link = await Utils.check_link(message, ignored_channel_ref=self.channel_signature_ref)
+            ignored_links: set[str] = set()
+            try:
+                async with session_factory() as session:
+                    ignored_links = await self.ad_link_exclusion_service.list_normalized_links(session)
+            except Exception as exc:
+                logger.error(
+                    "Failed to load automatic ad link exclusions for channel {}: {}",
+                    self.channel_id,
+                    exc,
+                )
+            check_link = await Utils.check_link(
+                message,
+                ignored_channel_ref=self.channel_signature_ref,
+                ignored_links=ignored_links,
+            )
             if check_link:
                 if await save_advertising(message):
                     await shift_timer()

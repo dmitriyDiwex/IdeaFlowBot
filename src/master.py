@@ -36,6 +36,7 @@ from src.editorial.services.telegram_actions import TelegramEditorialActions
 from src.confession_publisher import ConfessionPublisherRuntime
 from src.telegram_runtime import calculate_telegram_request_limit
 from src.panel_markups import (
+    build_ad_link_exclusions_panel,
     build_admin_menu,
     build_channel_actions,
     build_channel_history_import_progress_actions,
@@ -372,6 +373,38 @@ class MasterBot:
                 )
             ),
             reply_markup=build_extra_panel(is_general_admin=is_general_admin),
+        )
+
+    async def _show_ad_link_exclusions_panel(self, chat_id: int) -> None:
+        exclusions = await self.editorial_actions.list_ad_link_exclusions()
+        header = (
+            "Исключения для автоматических рекламных окон.\n\n"
+            "Если пост содержит только ссылку из этого списка, часовое рекламное окно "
+            "создано не будет. Ссылки самих каналов, которые используются в подписях, "
+            "исключаются автоматически и здесь не отображаются.\n\n"
+            "Исключённые ссылки:"
+        )
+        lines = [f"{index}. {row.url}" for index, row in enumerate(exclusions, start=1)]
+        if not lines:
+            lines = ["Список пока пуст."]
+
+        chunks: list[str] = []
+        current_chunk = header
+        for line in lines:
+            candidate = f"{current_chunk}\n{line}"
+            if len(candidate) <= 3900:
+                current_chunk = candidate
+                continue
+            chunks.append(current_chunk)
+            current_chunk = line
+        chunks.append(current_chunk)
+
+        for chunk in chunks[:-1]:
+            await self.main_bot.send_message(chat_id=chat_id, text=chunk)
+        await self.main_bot.send_message(
+            chat_id=chat_id,
+            text=chunks[-1],
+            reply_markup=build_ad_link_exclusions_panel(),
         )
 
     async def _send_database_export(self, chat_id: int) -> None:
@@ -2476,6 +2509,53 @@ class MasterBot:
             await self._show_channels_menu_for_input(message.chat.id, text_value)
             return True
 
+        if action == "await_add_ad_link_exclusion":
+            if not text_value:
+                self._set_user_state(message.chat.id, action)
+                await self.main_bot.send_message(message.chat.id, "Отправьте ссылку для исключения.")
+                return True
+            try:
+                exclusion, created = await self.editorial_actions.add_ad_link_exclusion(
+                    url=text_value,
+                    created_by=message.from_user.id if message.from_user else message.chat.id,
+                )
+            except ValueError as exc:
+                self._set_user_state(message.chat.id, action)
+                await self.main_bot.send_message(
+                    message.chat.id,
+                    f"{exc}\nОтправьте ссылку ещё раз.",
+                )
+                return True
+            result_text = (
+                f"Ссылка добавлена в исключения: {exclusion.url}"
+                if created
+                else f"Ссылка уже есть в исключениях: {exclusion.url}"
+            )
+            await self.main_bot.send_message(message.chat.id, result_text)
+            await self._show_ad_link_exclusions_panel(message.chat.id)
+            return True
+
+        if action == "await_delete_ad_link_exclusion":
+            if not text_value:
+                self._set_user_state(message.chat.id, action)
+                await self.main_bot.send_message(message.chat.id, "Отправьте ссылку, которую нужно удалить.")
+                return True
+            try:
+                exclusion = await self.editorial_actions.delete_ad_link_exclusion(url=text_value)
+            except ValueError as exc:
+                self._set_user_state(message.chat.id, action)
+                await self.main_bot.send_message(
+                    message.chat.id,
+                    f"{exc}\nОтправьте ссылку ещё раз.",
+                )
+                return True
+            await self.main_bot.send_message(
+                message.chat.id,
+                f"Ссылка удалена из исключений: {exclusion.url}",
+            )
+            await self._show_ad_link_exclusions_panel(message.chat.id)
+            return True
+
         if action == "await_statistics_delta_days":
             try:
                 delta_days = validate_statistics_delta_days(text_value)
@@ -3405,6 +3485,29 @@ class MasterBot:
                             f"Успешно: {result.sent}\n"
                             f"Отложено до восстановления Telegram: {result.deferred}\n"
                             f"Ошибок: {result.failed}",
+                        )
+                    case "ad_link_exclusions":
+                        await self._safe_answer_callback(self.main_bot, call.id)
+                        answered_early = True
+                        await self._show_ad_link_exclusions_panel(call.message.chat.id)
+                    case "add_ad_link_exclusion":
+                        await self._safe_answer_callback(self.main_bot, call.id)
+                        answered_early = True
+                        self._set_user_state(call.message.chat.id, "await_add_ad_link_exclusion")
+                        await self.main_bot.send_message(
+                            call.message.chat.id,
+                            (
+                                "Отправьте одну ссылку. После добавления она будет игнорироваться "
+                                "при автоматическом создании часовых рекламных окон."
+                            ),
+                        )
+                    case "delete_ad_link_exclusion":
+                        await self._safe_answer_callback(self.main_bot, call.id)
+                        answered_early = True
+                        self._set_user_state(call.message.chat.id, "await_delete_ad_link_exclusion")
+                        await self.main_bot.send_message(
+                            call.message.chat.id,
+                            "Отправьте ссылку, которую нужно удалить из списка исключений.",
                         )
                     case "extra":
                         await self._safe_answer_callback(self.main_bot, call.id)

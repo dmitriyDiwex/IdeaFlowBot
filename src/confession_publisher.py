@@ -10,6 +10,7 @@ from telebot.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import settings
 from src.editorial.db.session import session_factory
 from src.editorial.models.ad_blackout import ChannelAdBlackout
+from src.editorial.services.ad_link_exclusion_service import AdLinkExclusionService
 from src.editorial.services.confession_service import ConfessionService
 from src.editorial.services.legacy_publication_guard import LegacyPublicationGuard
 from src.utils import Utils
@@ -39,6 +40,7 @@ class ConfessionPublisherRuntime:
         self.polling_task: asyncio.Task | None = None
         self.service = ConfessionService()
         self.publication_guard = LegacyPublicationGuard()
+        self.ad_link_exclusion_service = AdLinkExclusionService()
         self._setup_handlers()
 
     @staticmethod
@@ -82,7 +84,23 @@ class ConfessionPublisherRuntime:
         own_channel_ref: str | int = (
             f"@{channel_username}" if channel_username else int(message.chat.id)
         )
-        if not await Utils.check_link(message, ignored_channel_ref=own_channel_ref):
+        ignored_links: set[str] = set()
+        exclusion_service = getattr(self, "ad_link_exclusion_service", None)
+        if exclusion_service is not None:
+            try:
+                async with session_factory() as session:
+                    ignored_links = await exclusion_service.list_normalized_links(session)
+            except Exception as exc:
+                logger.error(
+                    "Failed to load automatic ad link exclusions for confession channel {}: {}",
+                    message.chat.id,
+                    exc,
+                )
+        if not await Utils.check_link(
+            message,
+            ignored_channel_ref=own_channel_ref,
+            ignored_links=ignored_links,
+        ):
             return None
 
         published_at = message.date

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -116,6 +117,31 @@ async def test_confession_channel_own_link_does_not_create_blackout() -> None:
     )
 
     assert result is None
+    runtime.publication_guard.ensure_automatic_ad_blackout_for_channel_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confession_channel_manual_exclusion_does_not_create_blackout(monkeypatch) -> None:
+    runtime = object.__new__(ConfessionPublisherRuntime)
+    runtime.publication_guard = SimpleNamespace(
+        ensure_automatic_ad_blackout_for_channel_post=AsyncMock()
+    )
+    runtime.ad_link_exclusion_service = SimpleNamespace(
+        list_normalized_links=AsyncMock(return_value={"advertiser.example"})
+    )
+
+    @asynccontextmanager
+    async def fake_session_factory():
+        yield SimpleNamespace()
+
+    monkeypatch.setattr("src.confession_publisher.session_factory", fake_session_factory)
+
+    result = await runtime._ensure_external_link_blackout(
+        _channel_post("https://advertiser.example")
+    )
+
+    assert result is None
+    runtime.ad_link_exclusion_service.list_normalized_links.assert_awaited_once()
     runtime.publication_guard.ensure_automatic_ad_blackout_for_channel_post.assert_not_awaited()
 
 

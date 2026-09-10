@@ -1,5 +1,6 @@
 from src.editorial.models.channel import Channel, ChannelSettingProfile, ChannelSlot, ChannelSubscriberSnapshot
 from src.editorial.models.ad_blackout import ChannelAdBlackout
+from src.editorial.models.ad_link_exclusion import AdLinkExclusion
 from src.editorial.models.channel_history import ChannelHistoryMessage
 from src.editorial.models.content import ContentItem, ContentItemSource
 from src.editorial.models.confession import ConfessionPasteCandidate, ConfessionPublisher
@@ -31,6 +32,7 @@ from src.editorial.models.tag import ChannelPasteTagRule, GlobalPasteTagRule, Pa
 __all__ = [
     "Channel",
     "ChannelAdBlackout",
+    "AdLinkExclusion",
     "ChannelHistoryMessage",
     "ChannelPasteTagRule",
     "ChannelPasteTagRuleMode",

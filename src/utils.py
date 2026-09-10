@@ -1,6 +1,7 @@
 import pytz
 import json
 import re
+from collections.abc import Iterable
 from telebot.types import Message, CallbackQuery, InlineKeyboardButton
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -8,6 +9,7 @@ from loguru import logger
 from src.core_database.database import CrudBannedUser, CrudPostData
 from src.core_database.models.sender_info import SenderData
 from src.core_database.models.admin_actions import AdminActionData
+from src.editorial.services.ad_link_exclusion_service import normalized_ad_link_is_excluded
 from config import settings
 
 
@@ -306,11 +308,17 @@ class Utils:
         cls,
         message: Message,
         ignored_channel_ref: str | int | None = None,
+        ignored_links: Iterable[str] = (),
     ) -> bool:
-        for link in cls._extract_message_links(message):
-            if not cls._is_ignored_channel_link(link, ignored_channel_ref):
-                return True
-        return False
+        links = cls._extract_message_links(message)
+        ignored_links = tuple(ignored_links)
+        if any(normalized_ad_link_is_excluded(link, ignored_links) for link in links):
+            return False
+
+        return any(
+            not cls._is_ignored_channel_link(link, ignored_channel_ref)
+            for link in links
+        )
 
 
 def filter_chats(func):

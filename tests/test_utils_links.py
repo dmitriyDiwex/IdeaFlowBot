@@ -84,3 +84,25 @@ async def test_check_link_ignores_own_channel_inline_button() -> None:
     )
 
     assert not await Utils.check_link(message, ignored_channel_ref="@MIITrussia")
+
+
+@pytest.mark.asyncio
+async def test_check_link_ignores_manually_excluded_link_variants() -> None:
+    message = _message(text="Партнёр: http://www.Advertiser.Example/offer/.")
+
+    assert not await Utils.check_link(
+        message,
+        ignored_channel_ref="@MIITrussia",
+        ignored_links={"https://advertiser.example/offer"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_link_manual_exclusion_suppresses_other_external_links() -> None:
+    message = _message(text="https://advertiser.example https://other.example")
+
+    assert not await Utils.check_link(
+        message,
+        ignored_channel_ref="@MIITrussia",
+        ignored_links={"advertiser.example"},
+    )

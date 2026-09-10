@@ -29,6 +29,7 @@ from src.editorial.models.paste import PasteLibrary
 from src.editorial.models.publication import PublicationLog
 from src.editorial.models.submission import Submission
 from src.editorial.models.tag import ChannelPasteTagRule, GlobalPasteTagRule, TagDefinition, TagKeyword
+from src.editorial.services.ad_link_exclusion_service import AdLinkExclusionService
 from src.editorial.services.advertising import send_advertising_flow
 from src.editorial.services.admin_statistics_export import AdminStatisticsExportService
 from src.editorial.services.auto_slot_planner import AutoSlotPlannerService
@@ -130,6 +131,7 @@ class TelegramEditorialActions:
         self.confession_service = ConfessionService()
         self.auto_slot_planner = AutoSlotPlannerService()
         self.channel_profile_service = ChannelProfileService(legacy_reader=self.legacy_reader)
+        self.ad_link_exclusion_service = AdLinkExclusionService()
         self.tag_service = TagService()
         self.scheduler = SchedulerService()
         self.publisher = PublisherService()
@@ -459,6 +461,31 @@ class TelegramEditorialActions:
                 start_time=start_time,
                 end_time=end_time,
             )
+
+    async def list_ad_link_exclusions(self):
+        async with session_factory() as session:
+            return await self.ad_link_exclusion_service.list_exclusions(session)
+
+    async def list_normalized_ad_link_exclusions(self) -> set[str]:
+        async with session_factory() as session:
+            return await self.ad_link_exclusion_service.list_normalized_links(session)
+
+    async def add_ad_link_exclusion(
+        self,
+        *,
+        url: str,
+        created_by: int | None,
+    ):
+        async with session_factory() as session:
+            return await self.ad_link_exclusion_service.add_exclusion(
+                session,
+                url=url,
+                created_by=created_by,
+            )
+
+    async def delete_ad_link_exclusion(self, *, url: str):
+        async with session_factory() as session:
+            return await self.ad_link_exclusion_service.delete_exclusion(session, url=url)
 
     async def update_channel_setting(self, channel_id: int, field_name: str, raw_value: str) -> Channel:
         async with session_factory() as session:

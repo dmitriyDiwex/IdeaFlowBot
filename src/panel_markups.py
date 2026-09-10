@@ -38,6 +38,11 @@ def build_main_panel(is_general_admin: bool) -> InlineKeyboardMarkup:
     markup.add(
         InlineKeyboardButton("\u0414\u043e\u043f\u043e\u043b\u043d\u0438\u0442\u0435\u043b\u044c\u043d\u044b\u0435 \u0444\u0443\u043d\u043a\u0446\u0438\u0438", callback_data="panel:extra")
     )
+    markup.add(
+        InlineKeyboardButton(
+            "Добавить исключения для рекламы", callback_data="panel:ad_link_exclusions"
+        )
+    )
     return markup
 
 
@@ -54,6 +59,25 @@ def build_extra_panel(is_general_admin: bool = False) -> InlineKeyboardMarkup:
         )
     markup.add(InlineKeyboardButton("SQL -> CSV", callback_data="panel:sql_export"))
     markup.add(InlineKeyboardButton("\u041d\u0430\u0437\u0430\u0434 \u0432 \u043f\u0430\u043d\u0435\u043b\u044c", callback_data="panel:main"))
+    return markup
+
+
+def build_ad_link_exclusions_panel() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton(
+            "Ввести ссылку для исключения",
+            callback_data="panel:add_ad_link_exclusion",
+        ),
+        InlineKeyboardButton(
+            "Удалить исключённую ссылку",
+            callback_data="panel:delete_ad_link_exclusion",
+        ),
+        InlineKeyboardButton(
+            "Вернуться в панель",
+            callback_data="panel:main",
+        ),
+    )
     return markup
 
 
