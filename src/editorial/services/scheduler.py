@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from loguru import logger
-from sqlalchemy import case, desc, func, select
+from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -715,7 +715,20 @@ class SchedulerService:
         channel_id: int,
         candidate: ContentItem,
     ) -> bool:
+        exact_match_conditions = []
+        if candidate.origin_paste_id is not None:
+            # Confession pastes use the Telegram storage message as their
+            # identity, while legacy content items may contain a text-derived
+            # hash. The paste id is therefore the canonical duplicate key.
+            exact_match_conditions.append(
+                ContentItem.origin_paste_id == candidate.origin_paste_id
+            )
         if candidate.text_hash:
+            exact_match_conditions.append(ContentItem.text_hash == candidate.text_hash)
+        elif candidate.body_text:
+            exact_match_conditions.append(ContentItem.body_text == candidate.body_text)
+
+        if exact_match_conditions:
             exact_match_count = await session.scalar(
                 select(func.count())
                 .select_from(ContentItem)
@@ -723,23 +736,10 @@ class SchedulerService:
                 .where(
                     PublicationLog.channel_id == channel_id,
                     PublicationLog.publish_status == PublicationStatus.SENT,
-                    ContentItem.text_hash == candidate.text_hash,
+                    or_(*exact_match_conditions),
                 )
             )
             if exact_match_count:
-                return True
-        elif candidate.body_text:
-            exact_body_match_count = await session.scalar(
-                select(func.count())
-                .select_from(ContentItem)
-                .join(PublicationLog, PublicationLog.content_item_id == ContentItem.id)
-                .where(
-                    PublicationLog.channel_id == channel_id,
-                    PublicationLog.publish_status == PublicationStatus.SENT,
-                    ContentItem.body_text == candidate.body_text,
-                )
-            )
-            if exact_body_match_count:
                 return True
 
         recent_items = list(

@@ -561,10 +561,10 @@ docker compose ps
 
 `editorial-migrate` после успешных миграций обычно будет `Exited`, это нормально.
 
-Когда каналы, слоты и правила уже настроены, можно поднять фоновые scheduler/publisher:
+Когда каналы, слоты и правила уже настроены, можно поднять фоновые auto-slots/scheduler/publisher:
 
 ```bash
-docker compose up -d editorial-scheduler editorial-publisher
+docker compose up -d editorial-auto-slots editorial-scheduler editorial-publisher
 ```
 
 ### 4. Если Порт 8080 Занят

@@ -106,12 +106,26 @@ services:
       editorial-migrate:
         condition: service_completed_successfully
 
+  editorial-auto-slots:
+    image: ideaflowbot-app:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: sh -c "while true; do python -m src.editorial.cli auto-slots; sleep 60; done"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      editorial-migrate:
+        condition: service_completed_successfully
+
   editorial-scheduler:
     image: ideaflowbot-app:local
     restart: unless-stopped
     env_file:
       - .env
-    command: sh -c "while true; do python -m src.editorial.cli auto-slots; python -m src.editorial.cli schedule; sleep 300; done"
+    command: sh -c "while true; do python -m src.editorial.cli schedule; sleep 300; done"
     depends_on:
       postgres:
         condition: service_healthy

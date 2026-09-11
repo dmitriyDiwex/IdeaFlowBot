@@ -20,6 +20,7 @@
 - `editorial-api` — HTTP API для review/import/manual actions
 - `editorial-mcp` — защищённый MCP endpoint для модерации через Codex
 - `editorial-importer` — переносит новые legacy сообщения в `submissions`
+- `editorial-auto-slots` — раз в минуту распределяет автопланирование каналов внутри 30-минутного окна
 - `editorial-scheduler` — раскладывает approved контент по слотам
 - `editorial-publisher` — публикует scheduled контент в Telegram
 - `postgres` — новая editorial база
@@ -80,15 +81,23 @@ Importer:
 python -m src.editorial.cli import-legacy
 ```
 
+Auto slots:
+
+```bash
+python -m src.editorial.cli auto-slots
+```
+
 Scheduler:
 
 ```bash
 python -m src.editorial.cli sync-channel-profiles
-python -m src.editorial.cli auto-slots
 python -m src.editorial.cli schedule
 ```
 
-`editorial-scheduler` in `docker-compose.yml` runs auto-slot planning before every scheduler pass. The planner changes only channels with `auto_slots_enabled=true` and skips a channel/date after a successful plan.
+`editorial-auto-slots` in `docker-compose.yml` checks channels once per minute. Channels sharing the same
+`auto_slots_plan_time` receive stable offsets from 0 to 25 minutes, so they do not all hit PostgreSQL at once.
+The planner changes only channels with `auto_slots_enabled=true`, never plans the next day early, and skips a
+channel/date after a successful plan. `editorial-scheduler` continues to run independently every five minutes.
 
 Each scheduler pass preloads active slots, paste cooldown history, reservations, and tag rules in bulk. `EDITORIAL_SCHEDULER_COMMIT_BATCH_SIZE` controls how many database-only scheduling changes are committed together (default: `25`). This does not change slot or paste eligibility rules.
 

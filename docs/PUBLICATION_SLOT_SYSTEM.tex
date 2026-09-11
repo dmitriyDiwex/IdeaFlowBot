@@ -1,0 +1,1337 @@
+% !TeX program = xelatex
+% Сборка:
+% Из корня проекта:
+%   xelatex -interaction=nonstopmode -halt-on-error -output-directory=docs docs/PUBLICATION_SLOT_SYSTEM.tex
+%   xelatex -interaction=nonstopmode -halt-on-error -output-directory=docs docs/PUBLICATION_SLOT_SYSTEM.tex
+%
+% Документ описывает фактическое поведение текущей реализации IdeaFlowBot,
+% а не абстрактную целевую архитектуру.
+
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{iftex}
+\ifPDFTeX
+  \PackageError{PUBLICATION_SLOT_SYSTEM}
+    {This document requires XeLaTeX or LuaLaTeX}
+    {Run xelatex or lualatex instead of pdflatex.}
+\fi
+
+\usepackage{fontspec}
+\IfFontExistsTF{Libertinus Serif}{
+  \setmainfont{Libertinus Serif}
+  \setsansfont{Libertinus Sans}
+  \setmonofont{Libertinus Mono}
+}{
+  \setmainfont{Times New Roman}
+  \setsansfont{Arial}
+  \setmonofont{Consolas}
+}
+
+\usepackage[main=russian,english]{babel}
+\usepackage{geometry}
+\geometry{top=22mm,bottom=24mm,left=24mm,right=20mm}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\definecolor{linkblue}{HTML}{1756A9}
+\definecolor{codegray}{HTML}{F3F4F6}
+\definecolor{darkgray}{HTML}{444444}
+
+\hypersetup{
+  unicode=true,
+  colorlinks=true,
+  linkcolor=linkblue,
+  urlcolor=linkblue,
+  citecolor=linkblue,
+  pdftitle={Математическая модель публикации со слотами в IdeaFlowBot},
+  pdfauthor={IdeaFlowBot project documentation}
+}
+
+\setlist{nosep,leftmargin=2em}
+\setlength{\parindent}{1.25em}
+\setlength{\parskip}{0.35em}
+\setlength{\emergencystretch}{2em}
+\renewcommand{\arraystretch}{1.16}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{IdeaFlowBot}
+\fancyhead[R]{Модель публикации со слотами}
+\fancyfoot[C]{\thepage}
+\setlength{\headheight}{15pt}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  rulecolor=\color{darkgray!25},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  breaklines=true,
+  aboveskip=0.8em,
+  belowskip=0.8em
+}
+
+\DeclareMathOperator*{\argminop}{arg\,min}
+\newcommand{\Ind}{\mathbf{1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Empty}{\varnothing}
+\newcommand{\Status}[1]{\texttt{#1}}
+\newcommand{\Field}[1]{\texttt{#1}}
+\newcommand{\Source}[1]{\texttt{#1}}
+
+\title{\textbf{Математическая модель системы публикации\\со слотами, пастами и ограничениями}}
+\author{Техническое описание текущей реализации IdeaFlowBot}
+\date{23 августа 2026 года}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+В документе формализована действующая система публикации IdeaFlowBot: недельные
+шаблоны слотов, построение автослотов, выбор времени с jitter, назначение
+контента, роль библиотеки паст, правила тегов и cooldown, защита от дубликатов,
+дневные лимиты и поведение publisher при ошибках Telegram. Система трактуется
+как жадный диспетчер, решающий локальную задачу удовлетворения ограничений для
+каждого очередного слота. Отдельно перечислены следствия, которые непосредственно
+вытекают из текущего кода, в том числе бессрочная блокировка точного повтора в
+одном канале и диагностический, а не резервирующий характер
+\Field{paste\_slots}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Назначение модели}
+
+В системе необходимо разделять четыре разных объекта:
+
+\begin{enumerate}
+  \item \textbf{слот} задаёт повторяющуюся временную позицию канала;
+  \item \textbf{паста} хранит повторно используемый текст и правила его применимости;
+  \item \textbf{content item} представляет конкретного кандидата на публикацию;
+  \item \textbf{publication log} связывает content item с конкретным экземпляром
+        слота и хранит результат отправки.
+\end{enumerate}
+
+Паста не публикуется напрямую. Полный путь имеет вид
+
+\begin{equation}
+  \text{PasteLibrary}
+  \longrightarrow
+  \text{ContentItem}(\Source{paste})
+  \longrightarrow
+  \text{PublicationLog}(\text{slot})
+  \longrightarrow
+  \text{Telegram}.
+  \label{eq:paste-pipeline}
+\end{equation}
+
+Аналогично сообщения пользователей, редакторские материалы и сгенерированные
+тексты перед публикацией приводятся к единой сущности \texttt{ContentItem}:
+
+\begin{equation}
+  \{\text{Submission},\text{Editorial},\text{Generated},\text{Paste}\}
+  \longrightarrow \text{ContentItem}.
+\end{equation}
+
+Таким образом, scheduler не публикует исходные сущности. Он работает с
+унифицированным множеством кандидатов и при необходимости сам создаёт кандидата
+из библиотечной пасты.
+
+\section{Обозначения и сущности}
+
+Пусть заданы следующие множества:
+
+\begin{longtable}{>{$}l<{$} p{0.78\textwidth}}
+\toprule
+\text{Обозначение} & \text{Смысл} \\
+\midrule
+\endhead
+C & множество каналов; \\
+S_c & множество шаблонов слотов канала $c\in C$; \\
+I_c & множество content items канала $c$; \\
+P & библиотека паст; \\
+L & множество записей publication log; \\
+B_c & множество рекламных blackout-интервалов канала $c$; \\
+\mathcal{T} & временная шкала UTC; \\
+Z_c & временная зона канала $c$. \\
+\bottomrule
+\end{longtable}
+
+У content item имеется источник
+
+\begin{equation}
+  q_i\in
+  \{\Source{submission},\Source{editorial},\Source{paste},\Source{generated}\}
+\end{equation}
+
+и состояние
+
+\begin{equation}
+  \begin{aligned}
+    z_i\in\{&\Status{draft},\Status{pending\_review},\Status{approved},
+    \Status{scheduled},\\
+    &\Status{published},\Status{rejected},\Status{hold}\}.
+  \end{aligned}
+\end{equation}
+
+Статус publication log принадлежит множеству
+
+\begin{equation}
+  z_\ell\in
+  \{\Status{scheduled},\Status{sent},\Status{failed},\Status{cancelled}\}.
+\end{equation}
+
+Под \emph{живой публикацией в расписании} далее понимается log со статусом
+\Status{scheduled} или \Status{sent}. Именно эти два статуса учитываются в
+большинстве лимитов scheduler.
+
+\section{Недельные шаблоны и экземпляры слотов}
+
+\subsection{Шаблон слота}
+
+Слот канала хранится как тройка
+
+\begin{equation}
+  s=(c,w,\tau),
+\end{equation}
+
+где $c$ --- канал, $w\in\{0,\ldots,6\}$ --- номер дня недели, а $\tau$ ---
+локальное время. В базе запрещены два шаблона с одинаковой комбинацией
+
+\begin{equation}
+  (c,w,\tau).
+\end{equation}
+
+Шаблон является недельным, а не одноразовым. Для локальной календарной даты
+$d$ он порождает экземпляр слота тогда и только тогда, когда
+
+\begin{equation}
+  \operatorname{weekday}(d)=w.
+\end{equation}
+
+Конкретный экземпляр обозначим
+
+\begin{equation}
+  \sigma=(c,s,d).
+\end{equation}
+
+Его номинальное локальное время и соответствующее время UTC:
+
+\begin{align}
+  t^{\mathrm{loc}}_\sigma
+    &=\operatorname{datetime}(d,\tau,Z_c),\\
+  t^0_\sigma
+    &=\operatorname{UTC}\!\left(t^{\mathrm{loc}}_\sigma\right).
+\end{align}
+
+\subsection{Связь слота с publication log}
+
+Введём бинарную переменную назначения
+
+\begin{equation}
+  x_{i\sigma}=
+  \begin{cases}
+    1,&\text{если item $i$ назначен в экземпляр слота $\sigma$},\\
+    0,&\text{иначе}.
+  \end{cases}
+\end{equation}
+
+Для каждого экземпляра действует ограничение
+
+\begin{equation}
+  \sum_{i\in I_c}x_{i\sigma}\leq 1.
+  \label{eq:one-item-per-slot}
+\end{equation}
+
+На уровне базы это закреплено уникальностью
+
+\begin{equation}
+  (\Field{channel\_id},\Field{slot\_id},\Field{slot\_date}).
+\end{equation}
+
+Важно, что ограничение базы распространяется на \emph{все} статусы log. Поэтому
+даже \Status{failed} или \Status{cancelled} log уже занимает уникальную тройку.
+Логическая проверка scheduler ищет только \Status{scheduled}/\Status{sent}, но
+повторная вставка после failed/cancelled всё равно встретит ограничение
+уникальности и будет отменена через обработку ошибки целостности.
+
+\section{Автоматическое построение слотов}
+
+\subsection{Количество готового живого контента}
+
+Для канала $c$ и локального дня $d$ обозначим его границы UTC через
+
+\begin{equation}
+  [D_c^-(d),D_c^+(d)).
+\end{equation}
+
+Индикатор готовности item $i$ для этого дня:
+
+\begin{align}
+  R_i(c,d)={}&
+  \Ind[channel_i=c]\cdot
+  \Ind[z_i=\Status{approved}]\cdot
+  \Ind[scheduled\_for_i=\Empty] \notag\\
+  &\cdot\Ind[q_i\in\{\Source{submission},\Source{editorial}\}]\notag\\
+  &\cdot\Ind[publish\_after_i=\Empty\ \lor\ publish\_after_i<D_c^+(d)]\notag\\
+  &\cdot\Ind[expires\_at_i=\Empty\ \lor\ expires\_at_i>D_c^-(d)].
+\end{align}
+
+Тогда число готовых живых материалов равно
+
+\begin{equation}
+  A_c(d)=\sum_{i\in I_c}R_i(c,d).
+  \label{eq:approved-ready}
+\end{equation}
+
+При этом approved-пасты и generated-items в $A_c(d)$ не входят.
+
+\subsection{Сырой запрос на число слотов}
+
+Введём параметры канала:
+
+\begin{align*}
+  P_c^{\max}&=\Field{max\_paste\_per\_day},\\
+  M_c&=\Field{max\_posts\_per\_day},\\
+  m_c&=\Field{min\_slots\_per\_day}.
+\end{align*}
+
+Пастовый fallback:
+
+\begin{equation}
+  F_c=
+  \begin{cases}
+    P_c^{\max},&\Field{allow\_pastes}_c=\text{true},\\
+    0,&\Field{allow\_pastes}_c=\text{false}.
+  \end{cases}
+  \label{eq:paste-fallback}
+\end{equation}
+
+Первичный запрос на слоты:
+
+\begin{equation}
+  K_c^{\mathrm{raw}}(d)=\max\{A_c(d),F_c,m_c\}.
+  \label{eq:raw-slot-count}
+\end{equation}
+
+После дневного лимита:
+
+\begin{equation}
+  K_c^{\mathrm{limit}}(d)=
+  \min\{K_c^{\mathrm{raw}}(d),\max(M_c,0)\}.
+  \label{eq:day-capped-slot-count}
+\end{equation}
+
+\subsection{Вместимость временного окна}
+
+Пусть $a_c$ и $b_c$ --- начало и конец окна автослотов в минутах от начала
+локального дня, причём $b_c>a_c$. Длина окна
+
+\begin{equation}
+  L_c=b_c-a_c.
+\end{equation}
+
+Пусть
+
+\begin{equation}
+  g_c=\max\{\Field{min\_gap\_minutes}_c,0\}.
+\end{equation}
+
+Максимальное число минутных позиций в окне:
+
+\begin{equation}
+  Q_c=
+  \begin{cases}
+    \left\lfloor\dfrac{L_c}{g_c}\right\rfloor+1,&g_c>0,\\[6pt]
+    L_c+1,&g_c=0.
+  \end{cases}
+  \label{eq:window-capacity}
+\end{equation}
+
+Итоговое число создаваемых времён:
+
+\begin{equation}
+  K_c(d)=\min\{K_c^{\mathrm{limit}}(d),Q_c\}.
+  \label{eq:final-slot-count}
+\end{equation}
+
+Расчётное количество пастовых позиций:
+
+\begin{equation}
+  K_c^{\mathrm{paste}}(d)=
+  \min\{\max(0,K_c(d)-A_c(d)),F_c\}.
+  \label{eq:paste-slot-count}
+\end{equation}
+
+Значение~\eqref{eq:paste-slot-count} сохраняется только в объекте результата
+планирования. Слоты не маркируются как пастовые, и scheduler не использует
+$K_c^{\mathrm{paste}}$ как квоту или резервирование.
+
+\subsection{Равномерное размещение}
+
+Если $K=0$, список времён пуст. Если $K=1$, единственный слот ставится в
+середину окна:
+
+\begin{equation}
+  \tau_0=a+\operatorname{round}\!\left(\frac{L}{2}\right).
+\end{equation}
+
+Если $K>1$, времена вычисляются по формуле
+
+\begin{equation}
+  \tau_j=
+  a+\operatorname{round}\!\left(\frac{jL}{K-1}\right),
+  \qquad j=0,\ldots,K-1.
+  \label{eq:spread-times}
+\end{equation}
+
+Округление производится до целой минуты. Первый и последний слоты совпадают с
+границами окна, а промежуточные приближённо равноудалены.
+
+\subsection{Применение плана к недельным шаблонам}
+
+План строится не для отдельной таблицы датированных слотов. Он изменяет все
+шаблоны, соответствующие номеру дня недели целевой даты. Если параметр замены
+ручных слотов включён,
+
+\begin{equation}
+  \Field{auto\_slots\_replace\_manual}=true,
+\end{equation}
+
+planner может управлять и ручными шаблонами этого дня недели; иначе он удаляет
+или меняет только шаблоны с \Field{is\_auto\_managed}=true.
+
+Шаблоны, уже связанные в целевой день с log в состоянии \Status{scheduled} или
+\Status{sent}, не удаляются. Поле
+\Field{auto\_slots\_last\_planned\_for} обеспечивает не более одного
+успешного применения плана к одной целевой дате.
+
+\section{Момент запуска и jitter}
+
+\subsection{Окно обнаружения слота}
+
+Пусть $T$ --- текущее локальное время scheduler, $t^0$ --- номинальное локальное
+время экземпляра слота, $J\geq0$ --- \Field{slot\_jitter\_minutes}, а $W$ ---
+глобальный параметр \Field{scheduler\_window\_minutes}. Слот рассматривается,
+если
+
+\begin{equation}
+  t^0-J\leq T\leq t^0+\max(J,W).
+  \label{eq:due-window}
+\end{equation}
+
+На каждом запуске проверяются подходящие слоты локального вчера, сегодня и
+завтра. Это позволяет корректно захватывать экземпляры около границы UTC-дня.
+
+\subsection{Выбор фактической минуты}
+
+Пусть $\lceil T\rceil_{\mathrm{min}}$ означает округление вверх до целой минуты.
+При $J>0$ строится минутная решётка
+
+\begin{equation}
+  \mathcal{G}_\sigma(T)=
+  \left\{
+    t\in\mathcal{T}_{\mathrm{minute}}:
+    \max(t^0-J,\lceil T\rceil_{\mathrm{min}})
+    \leq t\leq t^0+J
+  \right\}.
+  \label{eq:jitter-grid}
+\end{equation}
+
+Из неё оставляются только моменты, для которых канал может публиковать:
+
+\begin{equation}
+  \mathcal{F}_\sigma(T)=
+  \{t\in\mathcal{G}_\sigma(T):CanPublish(c,t)=1\}.
+\end{equation}
+
+Список случайно перемешивается, после чего берётся первый элемент. Если все
+моменты имеют одинаковую допустимость, это эквивалентно равномерному выбору на
+конечном множестве $\mathcal{F}_\sigma(T)$.
+
+Если $J=0$, система пытается использовать ровно $t^0$. Если scheduler пришёл
+после $t^0+J$, но ещё не позднее $t^0+W$, допускается fallback
+
+\begin{equation}
+  t=\lceil T\rceil_{\mathrm{min}},
+\end{equation}
+
+при условии $CanPublish(c,t)=1$.
+
+\section{Ограничения канала}
+
+\subsection{Локальный день и дневной максимум}
+
+Для момента $t$ обозначим локальный день канала через $d_c(t)$, а его границы
+UTC через $[D_c^-(t),D_c^+(t))$. Число живых публикаций дня:
+
+\begin{equation}
+  N_c(t)=
+  \sum_{\ell\in L}
+  \Ind[channel_\ell=c]
+  \Ind[D_c^-(t)\leq scheduled_\ell<D_c^+(t)]
+  \Ind[z_\ell\in\{\Status{scheduled},\Status{sent}\}].
+  \label{eq:posts-today}
+\end{equation}
+
+Момент допустим только при
+
+\begin{equation}
+  N_c(t)<M_c.
+  \label{eq:max-posts-constraint}
+\end{equation}
+
+После назначения следующего item значение становится $N_c(t)+1\leq M_c$.
+
+\subsection{Минимальное расстояние между публикациями}
+
+Для каждого существующего живого log того же канала требуется
+
+\begin{equation}
+  |t-scheduled_\ell|\geq g_c.
+  \label{eq:min-gap-constraint}
+\end{equation}
+
+Код ищет публикации строго внутри интервала $(t-g_c,t+g_c)$, поэтому расстояние,
+в точности равное $g_c$, разрешено.
+
+\subsection{Рекламный blackout}
+
+Пусть
+
+\begin{equation}
+  B_c=\bigcup_{k}[a_{ck},b_{ck})
+\end{equation}
+
+--- объединение рекламных blackout-интервалов. Scheduler требует
+
+\begin{equation}
+  t\notin B_c.
+  \label{eq:blackout-constraint}
+\end{equation}
+
+Тем самым
+
+\begin{equation}
+  CanPublish(c,t)=
+  \Ind[t\notin B_c]
+  \Ind[N_c(t)<M_c]
+  \prod_{\ell\in L_c^{live}}
+  \Ind[|t-scheduled_\ell|\geq g_c].
+  \label{eq:can-publish}
+\end{equation}
+
+Publisher повторно проверяет blackout уже в фактический момент отправки. Если
+отправка попала внутрь $[a,b)$, log не отменяется, а получает
+
+\begin{equation}
+  retry\_after=b.
+\end{equation}
+
+\section{Допустимость content item}
+
+\subsection{Базовые условия}
+
+Item $i$ может рассматриваться для времени $t$, если
+
+\begin{align}
+  z_i&=\Status{approved},\\
+  publish\_after_i=\Empty\quad&\lor\quad publish\_after_i\leq t,\\
+  expires\_at_i=\Empty\quad&\lor\quad expires\_at_i>t.
+\end{align}
+
+Обозначим этот предикат через $Ready(i,t)$.
+
+\subsection{Лимиты по типу источника}
+
+Число паст, назначенных на локальный день:
+
+\begin{align}
+  N_c^{paste}(t)={}&
+  \sum_{\ell\in L}
+  \Ind[channel_\ell=c]
+  \Ind[scheduled_\ell\in d_c(t)]\notag\\
+  &\cdot\Ind[z_\ell\in\{\Status{scheduled},\Status{sent}\}]
+  \Ind[q_{item(\ell)}=\Source{paste}].
+\end{align}
+
+Для новой пасты необходимо
+
+\begin{equation}
+  \Field{allow\_pastes}_c=true,
+  \qquad
+  N_c^{paste}(t)<P_c^{\max}.
+  \label{eq:paste-day-limit}
+\end{equation}
+
+Аналогично для generated-контента:
+
+\begin{equation}
+  \Field{allow\_generated}_c=true,
+  \qquad
+  N_c^{gen}(t)<G_c^{\max}.
+  \label{eq:generated-day-limit}
+\end{equation}
+
+\subsection{Cooldown первичного тега}
+
+Если у кандидата имеется $primary\_tag_i=h$ и
+$H_c^{tag}=\Field{same\_tag\_cooldown\_hours}_c>0$, определяется последняя
+\emph{успешная} публикация того же primary tag:
+
+\begin{equation}
+  u_{c,h}=\max\{published_\ell:
+  channel_\ell=c,\ z_\ell=\Status{sent},\ primary\_tag_{item(\ell)}=h\}.
+\end{equation}
+
+Требуется
+
+\begin{equation}
+  u_{c,h}<t-H_c^{tag}.
+  \label{eq:tag-cooldown}
+\end{equation}
+
+Запланированные, но ещё не отправленные публикации в этом cooldown не входят.
+
+\subsection{Cooldown шаблона}
+
+Для непастового item с $template\_key_i=k$ вводится настройка
+
+\begin{equation}
+  H_c^{template}=\Field{same\_template\_cooldown\_hours}_c>0.
+\end{equation}
+
+Тогда требуется
+
+\begin{equation}
+  u_{c,k}^{template}<t-H_c^{template},
+  \label{eq:template-cooldown}
+\end{equation}
+
+где $u_{c,k}^{template}$ --- момент последней успешной публикации того же
+шаблона. Для паст эта проверка намеренно не выполняется.
+
+\section{Порядок выбора кандидата}
+
+Алгоритм не решает глобальную задачу оптимизации по всем слотам. Он последовательно
+обходит каналы и due-slots и для каждого слота выполняет локальный жадный выбор.
+
+\subsection{Этап 1: существующие негenerated-items}
+
+Для существующих кандидатов задаётся ранг источника
+
+\begin{equation}
+  r(i)=
+  \begin{cases}
+    0,&q_i=\Source{submission},\\
+    1,&q_i=\Source{editorial},\\
+    2,&q_i=\Source{paste},\\
+    3,&q_i=\Source{generated},\\
+    99,&\text{иначе}.
+  \end{cases}
+  \label{eq:source-rank}
+\end{equation}
+
+Сначала запрашиваются не более 50 approved-кандидатов, отличных от generated,
+в порядке
+
+\begin{equation}
+  (r(i),priority_i,created\_at_i)\uparrow.
+  \label{eq:candidate-order}
+\end{equation}
+
+Из этой последовательности выбирается первый item, прошедший лимиты и проверку
+дубликатов. Меньшее числовое значение \Field{priority} означает более высокий
+приоритет; при равенстве раньше выбирается более старый item.
+
+При отсутствии ограничения в 50 записей выбор можно было бы записать как
+
+\begin{equation}
+  i^*=\argminop_{i\in\mathcal{F}_{existing}(c,t)}
+  (r(i),priority_i,created\_at_i).
+\end{equation}
+
+\subsection{Этап 2: паста из библиотеки}
+
+Если существующего негenerated-кандидата нет, scheduler запрашивает доступные
+пасты. Весь допустимый список случайно перемешивается, после чего рассматриваются
+первые 20 записей. Для каждой строится временный образ content item, на котором
+проверяются лимиты и дубликаты.
+
+При успехе создаётся реальный item со значениями
+
+\begin{align}
+  q_i&=\Source{paste},\\
+  origin\_paste\_id_i&=id_p,\\
+  z_i&=\Status{approved},\\
+  review\_required_i&=false.
+\end{align}
+
+Создание item и назначение в слот выполняются внутри одной вложенной транзакции.
+
+\subsection{Этап 3: generated-items}
+
+Только после неуспеха первых двух этапов выбирается существующий approved-item с
+$q_i=\Source{generated}$. Для него также действуют временные ограничения,
+дневной лимит, cooldown по тегу и шаблону, а также проверка дубликатов.
+
+Фактическая последовательность предпочтений:
+
+\begin{equation}
+  \begin{aligned}
+    &\Source{submission}\succ \Source{editorial}\\
+    &\qquad\succ\text{готовый paste item}\\
+    &\qquad\succ\text{новый item из PasteLibrary}\succ \Source{generated}.
+  \end{aligned}
+  \label{eq:actual-priority}
+\end{equation}
+
+\section{Пасты как резервуар контента}
+
+\subsection{Создание и преобразование}
+
+Паста может быть создана вручную, из submission либо из существующего content
+item. При создании сохраняются исходный текст, нормализованный текст, SHA-256
+хеш, теги, primary tag, происхождение и cooldown-параметры.
+
+Ручное преобразование пасты в content item по умолчанию создаёт
+
+\begin{equation}
+  z_i=\Status{pending\_review},
+  \qquad review\_required_i=true.
+\end{equation}
+
+Автоматическое преобразование scheduler, напротив, использует
+\Status{approved} и $review\_required=false$. Следовательно, факт нахождения
+пасты в активной библиотеке рассматривается автоматикой как достаточная
+редакционная санкция на её использование при выполнении остальных правил.
+
+\subsection{Область разрешённых каналов}
+
+Для пасты $p$ и канала $c$:
+
+\begin{equation}
+  ScopeAllowed(p,c)=
+  allow\_all\_channels_p
+  \lor explicit\_allow(p,c).
+  \label{eq:paste-scope}
+\end{equation}
+
+Если $allow\_all\_channels_p=false$, должна существовать явная разрешающая
+пара $(p,c)$ в таблице правил каналов пасты.
+
+\subsection{Правила тегов}
+
+Множество тегов пасты включает кэшированные теги и primary tag:
+
+\begin{equation}
+  T_p=tags_p\cup
+  \begin{cases}
+    \{primary\_tag_p\},&primary\_tag_p\neq\Empty,\\
+    \Empty,&primary\_tag_p=\Empty.
+  \end{cases}
+\end{equation}
+
+Пусть $I_g$ и $E_g$ --- активные глобальные include/exclude-теги, а $I_c$ и
+$E_c$ --- активные include/exclude-теги канала. Учитываются только правила,
+чей временной интервал содержит текущий момент.
+
+Предикат теговой допустимости:
+
+\begin{align}
+  TagAllowed(p,c)={}&
+  \Ind[T_p\cap(E_g\cup E_c)=\Empty] \notag\\
+  &\cdot\Ind[I_g=\Empty\ \lor\ T_p\cap I_g\neq\Empty]\notag\\
+  &\cdot\Ind[I_c=\Empty\ \lor\ T_p\cap I_c\neq\Empty].
+  \label{eq:tag-allowed}
+\end{align}
+
+Следствия формулы~\eqref{eq:tag-allowed}:
+
+\begin{itemize}
+  \item любое пересечение с exclude немедленно запрещает пасту;
+  \item при непустом глобальном include нужно совпадение с глобальным набором;
+  \item при непустом канальном include независимо требуется совпадение с
+        канальным набором;
+  \item глобальный и канальный include соединены логическим ``И'', а не ``ИЛИ''.
+\end{itemize}
+
+\subsection{Источники сведений о последнем использовании}
+
+Контекст доступности собирает три вида исторических отметок:
+
+\begin{enumerate}
+  \item строки \texttt{PasteUsage};
+  \item успешные \texttt{PublicationLog.published\_at};
+  \item импортированную историю канала с \texttt{matched\_paste\_id}.
+\end{enumerate}
+
+Для каждой пасты берутся максимумы глобально и по каналу. Текущая функция
+объединения имеет следующую точную семантику. Пусть $u$ --- максимум PasteUsage,
+$v$ --- максимум published-at, $h$ --- максимум импортированной истории:
+
+\begin{equation}
+  Combine(u,v,h)=
+  \begin{cases}
+    v,&u=\Empty,\\
+    \max\{u,v,h\},&u\neq\Empty,
+  \end{cases}
+  \label{eq:combine-history}
+\end{equation}
+
+где отсутствующие аргументы не участвуют в максимуме. Поэтому при полном
+отсутствии PasteUsage импортированная история сама по себе не увеличивает
+последний момент использования; возвращается published-at. Это специальная
+совместимость с прежней семантикой текущего кода.
+
+Отдельно вычисляется максимум $scheduled\_for$ для log со статусом
+\Status{scheduled} или \Status{sent}. Он называется последней резервацией и
+нужен, чтобы одна scheduler-сессия не назначила пасту повторно до фактической
+публикации.
+
+\subsection{Глобальный и канальный cooldown пасты}
+
+Эффективный глобальный cooldown ограничивается константой в три дня:
+
+\begin{equation}
+  D_p^g=
+  \min\{\max(global\_cooldown\_days_p,0),3\}.
+  \label{eq:global-paste-cooldown}
+\end{equation}
+
+Пусть $U_p^g$ --- последнее глобальное использование, $R_p^g$ --- последняя
+глобальная резервация, $U_{pc}$ и $R_{pc}$ --- соответствующие значения в
+канале, а $T$ --- зафиксированный момент построения контекста. Тогда при
+$D_p^g>0$ требуется
+
+\begin{align}
+  U_p^g&<T-D_p^g,\\
+  R_p^g&<T-D_p^g.
+  \label{eq:global-paste-cooldown-constraints}
+\end{align}
+
+Для канального cooldown $D_p^c=per\_channel\_cooldown\_days_p$ требуется
+
+\begin{align}
+  U_{pc}&<T-D_p^c,\\
+  R_{pc}&<T-D_p^c.
+  \label{eq:channel-paste-cooldown-constraints}
+\end{align}
+
+Если $D_p^c=0$, прошлая отметка обычно не блокирует пасту, но резервация в
+настоящем или будущем всё равно удовлетворяет $R_{pc}\geq T$ и блокирует её.
+
+После каждого нового назначения контекст немедленно обновляет $R_p^g$ и
+$R_{pc}$. Поэтому глобальный cooldown может блокировать ту же пасту во всех
+остальных каналах уже в рамках текущего запуска scheduler.
+
+\subsection{Дополнительный cooldown канала на ту же пасту}
+
+В дополнение к собственному $D_p^c$ пасты применяется каналный параметр
+
+\begin{equation}
+  D_c^{same}=\Field{same\_paste\_cooldown\_days}_c.
+\end{equation}
+
+Пусть $S_{pc}$ --- максимальное $scheduled\_for$ среди log той же пасты и того
+же канала в статусе \Status{scheduled} либо \Status{sent}. Для планируемого
+момента $t$ требуется
+
+\begin{equation}
+  S_{pc}<t-D_c^{same}.
+  \label{eq:same-paste-cooldown}
+\end{equation}
+
+Итак, канальная повторяемость пасты одновременно ограничена её собственным
+$per\_channel\_cooldown\_days$, настройкой канала
+$same\_paste\_cooldown\_days$ и механизмом дубликатов.
+
+\subsection{Итоговый предикат доступности пасты}
+
+Без учёта проверки текста базовая доступность может быть записана как
+
+\begin{align}
+  PasteEligible(p,c,T)={}&
+  \Ind[status_p=\Status{active}]
+  \Ind[\Field{allow\_pastes}_c]\notag\\
+  &\cdot\Ind[ScopeAllowed(p,c)]
+  \Ind[TagAllowed(p,c)]\notag\\
+  &\cdot\Ind[GlobalCooldownAllowed(p,T)]\notag\\
+  &\cdot\Ind[ChannelCooldownAllowed(p,c,T)].
+  \label{eq:paste-eligible}
+\end{align}
+
+После этого дополнительно применяются дневной лимит паст, каналный cooldown той
+же пасты, cooldown primary tag и проверка exact/near duplicate.
+
+\section{Нормализация и защита от дубликатов}
+
+\subsection{Нормализация}
+
+Пусть $N(x)$ --- последовательность преобразований текста:
+
+\begin{enumerate}
+  \item очистка и схлопывание пробельных символов;
+  \item перевод в нижний регистр;
+  \item Unicode-нормализация NFKC;
+  \item удаление URL;
+  \item удаление упоминаний вида \texttt{@name};
+  \item удаление пунктуации;
+  \item повторное схлопывание пробелов.
+\end{enumerate}
+
+Точный идентификатор нормализованного текста:
+
+\begin{equation}
+  H(x)=SHA256(N(x)).
+  \label{eq:text-hash}
+\end{equation}
+
+Так как URL, mentions и пунктуация удаляются, тексты с различным исходным
+оформлением могут иметь одинаковый $H(x)$.
+
+\subsection{Exact duplicate}
+
+Кандидат $i$ является точным дубликатом в канале $c$, если существует хотя бы
+одна успешная историческая публикация $j$ с тем же хешем:
+
+\begin{equation}
+  ExactDuplicate(i,c)=
+  \Ind\!\left[
+    \exists j:\ channel_j=c,\ z_{log(j)}=\Status{sent},\ H_i=H_j
+  \right].
+  \label{eq:exact-duplicate}
+\end{equation}
+
+У этого условия нет временного окна: поиск выполняется по всей доступной
+истории publication log.
+
+\subsection{Near duplicate}
+
+Пусть $Recent_{25}(c)$ --- последние 25 успешно опубликованных items канала.
+Функция $sim(x,y)\in[0,1]$ --- коэффициент Python
+\texttt{SequenceMatcher.ratio} для нормализованных строк. При пороге
+$\theta=\Field{similarity\_threshold}$:
+
+\begin{equation}
+  NearDuplicate(i,c)=
+  \Ind\!\left[
+    \max_{j\in Recent_{25}(c)}sim(N(text_i),N(text_j))\geq\theta
+  \right].
+  \label{eq:near-duplicate}
+\end{equation}
+
+По умолчанию $\theta=0.82$. Итог:
+
+\begin{equation}
+  Duplicate(i,c)=ExactDuplicate(i,c)\lor NearDuplicate(i,c).
+  \label{eq:duplicate}
+\end{equation}
+
+Кандидат допускается только при $Duplicate(i,c)=0$.
+
+\subsection{Следствие для повторного использования паст}
+
+Неизменённая паста всегда создаёт item с тем же нормализованным текстом и тем же
+хешем. После первой успешной публикации пасты $p$ в канале $c$ выполняется
+
+\begin{equation}
+  ExactDuplicate(i_p,c)=1
+\end{equation}
+
+для всех последующих items из той же неизменённой пасты. Поэтому истечение
+\Field{same\_paste\_cooldown\_days} само по себе не делает пасту повторно
+доступной в том же канале. На практике текущая схема позволяет безопасно
+распространять одну пасту по разным каналам, но запрещает точный повтор внутри
+одного канала бессрочно.
+
+\section{Формальная задача назначения}
+
+Для каждого due-slot $\sigma$ scheduler фактически ищет пару $(i,t)$, такую что
+
+\begin{align}
+  &t\in\mathcal{F}_\sigma(T),\\
+  &Ready(i,t)=1,\\
+  &TypeLimits(i,c,t)=1,\\
+  &Cooldowns(i,c,t)=1,\\
+  &Duplicate(i,c)=0.
+\end{align}
+
+Глобальная система ограничений может быть записана следующим образом:
+
+\begin{align}
+  \sum_i x_{i\sigma}&\leq1
+    &&\forall\sigma,
+    \label{eq:csp-slot}\\
+  \sum_\sigma x_{i\sigma}&\leq1
+    &&\forall i\text{ в рамках нормального жизненного цикла},
+    \label{eq:csp-item}\\
+  \sum_{i,\sigma:\,d_c(t_\sigma)=d}x_{i\sigma}&\leq M_c
+    &&\forall c,d,
+    \label{eq:csp-day}\\
+  \sum_{i:q_i=\Source{paste}}x_{i\sigma(d,c)}&\leq P_c^{\max}
+    &&\forall c,d,
+    \label{eq:csp-paste}\\
+  \sum_{i:q_i=\Source{generated}}x_{i\sigma(d,c)}&\leq G_c^{\max}
+    &&\forall c,d,
+    \label{eq:csp-generated}\\
+  |t_\sigma-t_{\sigma'}|&\geq g_c
+    &&\forall\sigma\neq\sigma'\text{ одного канала},
+    \label{eq:csp-gap}\\
+  t_\sigma&\notin B_c
+    &&\forall\sigma.
+    \label{eq:csp-blackout}
+\end{align}
+
+Однако реализация не решает эту систему целиком и не максимизирует число
+заполненных слотов. Она фиксирует решения по одному слоту. Поэтому ранний жадный
+выбор потенциально может лишить более поздний слот кандидата, который подошёл бы
+ему лучше. Это нормальное свойство применяемого online-алгоритма.
+
+Упрощённый псевдокод:
+
+\begin{lstlisting}
+for channel in active_channels:
+    for slot in due_slots(channel):
+        if slot_is_used(slot):
+            continue
+        if not channel_can_publish(channel, slot.time):
+            continue
+
+        item = first_feasible_existing_non_generated()
+        if item is None:
+            item = create_from_random_feasible_library_paste()
+        if item is None:
+            item = first_feasible_generated()
+
+        if item is not None:
+            item.status = scheduled
+            insert PublicationLog(slot, item, scheduled)
+\end{lstlisting}
+
+\section{Автоматы состояний}
+
+\subsection{Content item}
+
+Нормальный путь публикации:
+
+\begin{equation}
+  \Status{approved}
+  \xrightarrow{scheduler}
+  \Status{scheduled}
+  \xrightarrow{Telegram\ success}
+  \Status{published}.
+  \label{eq:item-state-success}
+\end{equation}
+
+При временной транспортной ошибке:
+
+\begin{equation}
+  \Status{scheduled}
+  \xrightarrow{transient\ error}
+  \Status{scheduled}.
+  \label{eq:item-state-transient}
+\end{equation}
+
+При постоянной ошибке данных или конфигурации:
+
+\begin{equation}
+  \Status{scheduled}
+  \xrightarrow{permanent\ error}
+  \Status{approved}.
+  \label{eq:item-state-permanent}
+\end{equation}
+
+При неактивном канале scheduled-item также возвращается в \Status{approved} и
+получает $scheduled\_for=\Empty$.
+
+\subsection{Publication log}
+
+Переходы log:
+
+\begin{align}
+  \Status{scheduled}&\xrightarrow{success}\Status{sent},\\
+  \Status{scheduled}&\xrightarrow{transient}\Status{scheduled},\\
+  \Status{scheduled}&\xrightarrow{permanent}\Status{failed},\\
+  \Status{scheduled}&\xrightarrow{inactive\ channel}\Status{cancelled}.
+\end{align}
+
+После успешной публикации item из пасты создаётся \texttt{PasteUsage} с текущим
+моментом. Эта строка участвует в последующих cooldown-расчётах.
+
+\section{Publisher и повторные попытки}
+
+\subsection{Выбор due-публикации}
+
+Publisher выбирает log, для которого
+
+\begin{align}
+  z_\ell&=\Status{scheduled},\\
+  scheduled_\ell&\leq T,\\
+  retry\_after_\ell=\Empty\quad&\lor\quad retry\_after_\ell\leq T.
+\end{align}
+
+Порядок выбора:
+
+\begin{equation}
+  (scheduled_\ell,id_\ell)\uparrow.
+\end{equation}
+
+За один шаг блокируется ровно одна строка через
+\texttt{FOR UPDATE SKIP LOCKED}. Это позволяет нескольким worker-процессам не
+брать одну и ту же публикацию и не удерживает весь batch из-за одного медленного
+Telegram-вызова.
+
+\subsection{Успех и постоянные ошибки}
+
+При успехе сохраняются Telegram message id и published-at, после чего
+
+\begin{align}
+  z_\ell&=\Status{sent},\\
+  z_i&=\Status{published},\\
+  retry\_after_\ell&=\Empty.
+\end{align}
+
+Отсутствие binding саб-бота считается постоянной ошибкой:
+
+\begin{align}
+  z_\ell&=\Status{failed},\\
+  z_i&=\Status{approved}.
+\end{align}
+
+Неактивный канал приводит к \Status{cancelled}, а отсутствие самого content item
+или канала --- к \Status{failed} log.
+
+\subsection{Экспоненциальный backoff}
+
+Пусть $n\geq1$ --- номер уже начатой попытки, $B$ --- базовая задержка,
+$B_{\max}$ --- максимум. Локальная задержка publisher:
+
+\begin{equation}
+  b_n=
+  \min\left\{
+    B\cdot2^{\min(\max(n-1,0),4)},
+    B_{\max}
+  \right\}.
+  \label{eq:publisher-backoff}
+\end{equation}
+
+Если Telegram передал собственное значение $r=retry\_after$, итог:
+
+\begin{equation}
+  \Delta_n=\max\{b_n,r\}.
+  \label{eq:telegram-retry-after}
+\end{equation}
+
+Новая попытка разрешена после
+
+\begin{equation}
+  retry\_after=T+\Delta_n.
+\end{equation}
+
+При значениях по умолчанию $B=60$ секунд и $B_{\max}=900$ секунд последовательность
+локальных задержек равна
+
+\begin{equation}
+  60,\ 120,\ 240,\ 480,\ 900,\ 900,\ldots
+\end{equation}
+
+После первой временной транспортной ошибки текущий проход publisher прекращается.
+Это выполняет роль простого circuit breaker и предотвращает шторм запросов при
+общей недоступности Telegram.
+
+\section{Числовые примеры}
+
+\subsection{Расчёт автослотов}
+
+Пусть канал имеет параметры
+
+\begin{equation}
+  A=2,\qquad P^{\max}=3,\qquad m=4,\qquad M=6,
+\end{equation}
+
+окно 10:00--22:00 и $g=60$ минут. Тогда
+
+\begin{align}
+  F&=3,\\
+  L&=720,\\
+  Q&=\left\lfloor\frac{720}{60}\right\rfloor+1=13,\\
+  K&=\min\{\max(2,3,4),6,13\}=4,\\
+  K^{paste}&=\min\{\max(0,4-2),3\}=2.
+\end{align}
+
+По формуле~\eqref{eq:spread-times} получаем
+
+\begin{equation}
+  10{:}00,\qquad14{:}00,\qquad18{:}00,\qquad22{:}00.
+\end{equation}
+
+Ожидается два живых материала и до двух паст, но это не жёсткое распределение.
+Если живой item не пройдёт duplicate-проверку, его слот может занять паста. Если
+подходящих паст нет, слот останется пустым. Если в очереди уже есть approved paste
+item, он участвует среди существующих кандидатов раньше библиотечного fallback.
+
+\subsection{Ограничение вместимостью}
+
+Пусть окно 10:00--12:00, запрошено $K^{limit}=5$, а $g=60$. Тогда
+
+\begin{equation}
+  L=120,\qquad Q=\left\lfloor\frac{120}{60}\right\rfloor+1=3,
+\end{equation}
+
+поэтому реально создаются только три времени:
+
+\begin{equation}
+  10{:}00,\qquad11{:}00,\qquad12{:}00.
+\end{equation}
+
+\subsection{Cooldown пасты}
+
+Пусть у пасты $D_p^g=1$ день, $D_p^c=120$ дней. Она использована в канале $c_1$
+два часа назад. Тогда глобально
+
+\begin{equation}
+  U_p^g\geq T-1\text{ день},
+\end{equation}
+
+поэтому паста временно недоступна даже каналу $c_2$. После истечения глобального
+дня она может стать доступной в $c_2$, но в $c_1$ останется заблокированной
+канальным cooldown и, после успешной публикации, exact-duplicate проверкой.
+
+\subsection{Jitter}
+
+Пусть номинальный слот равен 16:00, $J=30$ минут, scheduler запущен в 15:42.
+Тогда минутная решётка до фильтрации:
+
+\begin{equation}
+  \mathcal{G}=\{15{:}42,15{:}43,\ldots,16{:}30\}.
+\end{equation}
+
+Если из-за min-gap и blackout допустимы только
+
+\begin{equation}
+  \mathcal{F}=\{15{:}55,15{:}56,16{:}20\},
+\end{equation}
+
+одна из этих трёх минут будет выбрана после случайного перемешивания.
+
+\section{Фактические свойства и ограничения текущей реализации}
+
+Ниже перечислены свойства, важные для интерпретации формул и настройки системы.
+
+\begin{enumerate}
+  \item \textbf{Слот не имеет типа контента.}
+        $K^{paste}$ является диагностикой плана, а не резервом пастовых слотов.
+
+  \item \textbf{Реальный контент имеет абсолютный, а не процентный приоритет.}
+        Параметр \Field{prefer\_real\_ratio} хранится в модели и профилях, но
+        текущий scheduler его не использует.
+
+  \item \textbf{Параметр очереди пока декларативный.}
+        \Field{min\_ready\_queue} не входит ни в формулу автослотов, ни в выбор
+        кандидата.
+
+  \item \textbf{Оценка активности пасты не применяется.}
+        \Field{min\_channel\_activity\_score} присутствует у пасты, но не участвует
+        в построении контекста доступности.
+
+  \item \textbf{Пасты выбираются случайно.}
+        После фильтрации доступный список перемешивается криптографическим
+        генератором \texttt{SystemRandom}; явной оптимизации по ``давно не
+        использовалась'' нет.
+
+  \item \textbf{Exact duplicate бессрочен.}
+        Неизменённая паста после первой успешной публикации не сможет повториться
+        в том же канале даже после окончания cooldown.
+
+  \item \textbf{Failed/cancelled log фактически закрывает slot-day.}
+        Это следует из уникальности $(channel,slot,date)$ для всех статусов,
+        несмотря на то что предварительная логическая проверка считает занятыми
+        только scheduled/sent.
+
+  \item \textbf{Автоплан меняет недельные шаблоны.}
+        Стандартное время планирования равно 23{:}30, а стандартное окно ---
+        10{:}00--22{:}00. Поэтому новый набор времён создаётся после завершения текущего
+        окна. Поэтому при первом запуске он не заполнит уже прошедший день, а как
+        недельный шаблон практически повлияет на следующее наступление этого дня
+        недели. В дальнейшем существовавший с прошлой недели шаблон может
+        обслужить текущий день до вечернего перепланирования.
+
+  \item \textbf{Алгоритм online и жадный.}
+        Нет глобального перераспределения кандидатов между будущими слотами и нет
+        возврата к предыдущему выбору.
+\end{enumerate}
+
+\section{Карта параметров}
+
+\begingroup
+\footnotesize
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.40\textwidth}p{0.50\textwidth}}
+\toprule
+\textbf{Параметр} & \textbf{Математическая роль} \\
+\midrule
+\endhead
+\Field{min\_slots\_per\_day} & Нижняя граница запроса на число автослотов $m_c$. \\
+\Field{max\_posts\_per\_day} & Верхняя граница числа scheduled/sent публикаций $M_c$. \\
+\Field{max\_paste\_per\_day} & Дневной лимит паст $P_c^{\max}$ и пастовый fallback $F_c$. \\
+\Field{max\_generated\_per\_day} & Дневной лимит generated-контента $G_c^{\max}$. \\
+\Field{min\_gap\_minutes} & Минимальное расстояние $g_c$ между scheduled-for. \\
+\Field{slot\_jitter\_minutes} & Полуширина $J$ интервала выбора фактической минуты. \\
+\Field{same\_tag\_cooldown\_hours} & Cooldown $H_c^{tag}$ по primary tag. \\
+\Field{same\_template\_cooldown\_hours} & Cooldown $H_c^{template}$ по шаблону непастового item. \\
+\Field{same\_paste\_cooldown\_days} & Дополнительный каналный cooldown $D_c^{same}$ пасты. \\
+\Field{global\_cooldown\_days} & Глобальный cooldown пасты, программно ограниченный тремя днями. \\
+\Field{per\_channel\_cooldown\_days} & Собственный cooldown пасты в конкретном канале. \\
+\Field{allow\_pastes} & Разрешает пастовый fallback и публикацию paste-items. \\
+\Field{allow\_generated} & Разрешает generated-контент на последнем этапе выбора. \\
+\Field{similarity\_threshold} & Порог $\theta$ near-duplicate проверки, по умолчанию 0.82. \\
+\Field{publisher\_retry\_base\_seconds} & База экспоненциального backoff $B$, по умолчанию 60 секунд. \\
+\Field{publisher\_retry\_max\_seconds} & Верхняя граница backoff $B_{\max}$, по умолчанию 900 секунд. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\section{Связь с исходным кодом}
+
+Описание соответствует следующим компонентам проекта:
+
+\begin{itemize}
+  \item модели каналов и слотов: \path{src/editorial/models/channel.py};
+  \item content items: \path{src/editorial/models/content.py};
+  \item пасты и история использования: \path{src/editorial/models/paste.py};
+  \item журнал публикаций: \path{src/editorial/models/publication.py};
+  \item автоматические слоты: \path{src/editorial/services/auto_slot_planner.py};
+  \item назначение контента: \path{src/editorial/services/scheduler.py};
+  \item доступность паст: \path{src/editorial/services/paste_service.py};
+  \item правила тегов: \path{src/editorial/services/tag_service.py};
+  \item отправка в Telegram: \path{src/editorial/services/publisher.py};
+  \item backoff и классификация ошибок: \path{src/editorial/services/telegram_resilience.py};
+  \item нормализация и similarity: \path{src/editorial/utils/text.py}.
+\end{itemize}
+
+\section{Заключение}
+
+Система может быть охарактеризована как жадный стохастический scheduler с
+дискретным минутным временем. Автопланировщик определяет ёмкость недельного
+расписания по максимуму живой очереди, пастового fallback и минимального числа
+слотов, после чего ограничивает её дневным максимумом и геометрией временного
+окна. Основной scheduler для каждого due-slot случайно выбирает допустимую минуту
+и лексикографически предпочитает живой контент. Пасты образуют резервуар
+предварительно одобренного текста, но перед назначением проходят независимые
+канальные, теговые, cooldown- и duplicate-ограничения. Publisher завершает
+автомат состояний, обеспечивая идемпотентное владение due-log, экспоненциальные
+повторные попытки и возврат content item в approved при постоянной ошибке.
+
+\end{document}

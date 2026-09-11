@@ -15,6 +15,10 @@ from src.editorial.models.publication import PublicationLog
 from src.editorial.config import settings
 
 
+AUTO_SLOT_MAX_DELAY_MINUTES = 30
+AUTO_SLOT_POLL_MARGIN_MINUTES = 5
+
+
 @dataclass(slots=True)
 class AutoSlotChannelPlan:
     channel_id: int
@@ -78,17 +82,40 @@ class AutoSlotPlannerService:
 
     def _target_date_for_channel(self, channel: Channel, now: datetime) -> date | None:
         local_now = now.astimezone(ZoneInfo(channel.timezone))
-        if local_now.time() < channel.auto_slots_plan_time:
+        target_date = local_now.date()
+        planning_window = self._planning_window_for_channel(channel, target_date)
+        if planning_window is None:
             return None
 
-        target_date = local_now.date()
-        if local_now.time() >= channel.auto_slots_window_end:
-            target_date += timedelta(days=1)
+        planned_at, deadline = planning_window
+        if local_now < planned_at or local_now > deadline:
+            return None
 
         if channel.auto_slots_last_planned_for != target_date:
             return target_date
 
         return None
+
+    @staticmethod
+    def _planning_window_for_channel(
+        channel: Channel,
+        target_date: date,
+    ) -> tuple[datetime, datetime] | None:
+        tz = ZoneInfo(channel.timezone)
+        plan_time = datetime.combine(target_date, channel.auto_slots_plan_time, tzinfo=tz)
+        publication_window_end = datetime.combine(target_date, channel.auto_slots_window_end, tzinfo=tz)
+        deadline = min(
+            plan_time + timedelta(minutes=AUTO_SLOT_MAX_DELAY_MINUTES),
+            publication_window_end,
+        )
+        if deadline <= plan_time:
+            return None
+
+        available_minutes = int((deadline - plan_time).total_seconds() // 60)
+        max_offset_minutes = max(0, available_minutes - AUTO_SLOT_POLL_MARGIN_MINUTES)
+        channel_key = int(channel.id if channel.id is not None else channel.tg_channel_id)
+        offset_minutes = channel_key % (max_offset_minutes + 1)
+        return plan_time + timedelta(minutes=offset_minutes), deadline
 
     async def _build_channel_plan(
         self,

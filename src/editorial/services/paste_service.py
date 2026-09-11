@@ -89,6 +89,17 @@ class PasteAvailabilityContext:
             if not paste.allow_all_channels and (paste.id, channel_id) not in self.explicitly_allowed_pairs:
                 continue
 
+            if channel_family == ContentFamily.CONFESSION.value:
+                paste_channel_key = (paste.id, channel_id)
+                # A confession paste is a finite Telegram source message, not
+                # reusable filler. Once it has been used or reserved for a
+                # channel, it must never be selected for that channel again.
+                if (
+                    paste_channel_key in self.last_used_by_channel
+                    or paste_channel_key in self.last_reserved_by_channel
+                ):
+                    continue
+
             if channel_family != ContentFamily.CONFESSION.value:
                 paste_tags = set(paste.tags or [])
                 if paste.primary_tag:

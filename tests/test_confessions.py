@@ -13,6 +13,7 @@ from src.editorial.models.paste import PasteLibrary
 from src.editorial.services.confession_service import ConfessionService
 from src.editorial.services.paste_service import PasteAvailabilityContext
 from src.editorial.services.publisher import PublisherService
+from src.editorial.services.scheduler import SchedulerService
 from src.confession_publisher import ConfessionPublisherRuntime
 from src.panel_markups import build_confession_channel_actions
 
@@ -52,6 +53,59 @@ def test_confession_channel_only_receives_confession_pastes() -> None:
     )
 
     assert context.available_for_channel(10) == [confession]
+
+
+def test_confession_paste_is_never_reused_in_the_same_channel() -> None:
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    confession = _paste(2, ContentFamily.CONFESSION.value)
+    context = PasteAvailabilityContext(
+        reference_now=now,
+        channel_ids=frozenset({10, 20}),
+        pastes=[confession],
+        channel_families={
+            10: ContentFamily.CONFESSION.value,
+            20: ContentFamily.CONFESSION.value,
+        },
+        last_used_by_channel={(2, 10): datetime(2025, 1, 1, tzinfo=timezone.utc)},
+    )
+
+    assert context.available_for_channel(10) == []
+    assert context.available_for_channel(20) == [confession]
+
+
+def test_confession_paste_is_not_reused_after_an_old_reservation() -> None:
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    confession = _paste(2, ContentFamily.CONFESSION.value)
+    context = PasteAvailabilityContext(
+        reference_now=now,
+        channel_ids=frozenset({10}),
+        pastes=[confession],
+        channel_families={10: ContentFamily.CONFESSION.value},
+        last_reserved_by_channel={(2, 10): datetime(2025, 1, 1, tzinfo=timezone.utc)},
+    )
+
+    assert context.available_for_channel(10) == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_detects_same_paste_when_confession_hashes_differ() -> None:
+    session = SimpleNamespace(scalar=AsyncMock(return_value=1))
+    candidate = SimpleNamespace(
+        origin_paste_id=2,
+        text_hash="telegram-storage-identity-hash",
+        body_text="Признание",
+        normalized_text="признание",
+    )
+
+    duplicate = await SchedulerService()._is_duplicate_for_channel(
+        session,
+        channel_id=10,
+        candidate=candidate,
+    )
+
+    assert duplicate is True
+    duplicate_query = str(session.scalar.await_args.args[0])
+    assert "content_items.origin_paste_id" in duplicate_query
 
 
 @pytest.mark.parametrize(
