@@ -6,6 +6,7 @@ import pytest
 from src.editorial.services.ad_link_exclusion_service import (
     AdLinkExclusionService,
     normalize_ad_link,
+    normalized_ad_link_is_excluded,
 )
 from src.master import MasterBot
 from src.panel_markups import build_ad_link_exclusions_panel, build_main_panel
@@ -30,6 +31,30 @@ def test_normalize_ad_link(value: str, expected: str) -> None:
 def test_normalize_ad_link_rejects_invalid_input(value: str) -> None:
     with pytest.raises(ValueError):
         normalize_ad_link(value)
+
+
+@pytest.mark.parametrize(
+    ("link", "exclusion", "expected"),
+    [
+        (
+            "https://ya.cc/t/OqZhkpIBB3ZVQo/?erid=j1SUm4f7YS6wocevC",
+            "https://ya.cc",
+            True,
+        ),
+        ("https://example.com/offer/details", "example.com/offer", True),
+        ("https://example.com/offer?id=1", "example.com/offer", True),
+        ("https://example.com/offer?id=1&source=ad", "example.com/offer?id=1", True),
+        ("https://example.com/offering", "example.com/offer", False),
+        ("https://ya.cc.evil.example/t/123", "ya.cc", False),
+        ("https://notya.cc/t/123", "ya.cc", False),
+    ],
+)
+def test_normalized_ad_link_exclusion_uses_safe_url_prefix(
+    link: str,
+    exclusion: str,
+    expected: bool,
+) -> None:
+    assert normalized_ad_link_is_excluded(link, {exclusion}) is expected
 
 
 def test_main_panel_places_ad_exclusions_after_extra_functions() -> None:

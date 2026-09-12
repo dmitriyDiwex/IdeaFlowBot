@@ -73,6 +73,8 @@ def normalize_ad_link(value: str) -> str:
 
 
 def normalized_ad_link_is_excluded(link: str, exclusions: Iterable[str]) -> bool:
+    """Return whether a link matches an excluded URL prefix on a URL boundary."""
+
     try:
         normalized_link = normalize_ad_link(link)
     except ValueError:
@@ -84,7 +86,19 @@ def normalized_ad_link_is_excluded(link: str, exclusions: Iterable[str]) -> bool
             normalized_exclusions.add(normalize_ad_link(exclusion))
         except ValueError:
             continue
-    return normalized_link in normalized_exclusions
+
+    for normalized_exclusion in normalized_exclusions:
+        if normalized_link == normalized_exclusion:
+            return True
+        if not normalized_link.startswith(normalized_exclusion):
+            continue
+
+        remainder = normalized_link[len(normalized_exclusion):]
+        if remainder.startswith(("/", "?")):
+            return True
+        if "?" in normalized_exclusion and remainder.startswith("&"):
+            return True
+    return False
 
 
 class AdLinkExclusionService:

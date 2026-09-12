@@ -98,6 +98,17 @@ async def test_check_link_ignores_manually_excluded_link_variants() -> None:
 
 
 @pytest.mark.asyncio
+async def test_check_link_ignores_child_url_of_excluded_domain() -> None:
+    message = _message(text="https://ya.cc/t/OqZhkpIBB3ZVQo/?erid=j1SUm4f7YS6wocevC")
+
+    assert not await Utils.check_link(
+        message,
+        ignored_channel_ref="@MIITrussia",
+        ignored_links={"https://ya.cc"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_check_link_manual_exclusion_suppresses_other_external_links() -> None:
     message = _message(text="https://advertiser.example https://other.example")
 
