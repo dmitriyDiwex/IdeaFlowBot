@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from loguru import logger
-from sqlalchemy import case, desc, func, or_, select
+from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +17,9 @@ from src.editorial.models.content import ContentItem
 from src.editorial.models.enums import ContentFamily, ContentItemStatus, ContentSourceType, PublicationStatus
 from src.editorial.models.paste import PasteLibrary
 from src.editorial.models.publication import PublicationLog
+from src.editorial.models.submission import Submission
 from src.editorial.services.paste_service import PasteAvailabilityContext, PasteService
+from src.editorial.utils.media import build_media_fingerprint, is_media_submission
 from src.editorial.utils.text import similarity_score
 
 
@@ -715,6 +717,19 @@ class SchedulerService:
         channel_id: int,
         candidate: ContentItem,
     ) -> bool:
+        origin_submission_id = getattr(candidate, "origin_submission_id", None)
+        if origin_submission_id is not None:
+            submission = await session.get(Submission, origin_submission_id)
+            if submission is not None and is_media_submission(submission):
+                # Repair items created with caption/placeholder hashes by older
+                # versions as they re-enter scheduling, without re-moderation.
+                candidate.normalized_text, candidate.text_hash = build_media_fingerprint(submission)
+                return await self._is_duplicate_media_for_channel(session, channel_id, candidate, submission)
+
+        text_only = or_(
+            ContentItem.origin_submission_id.is_(None),
+            and_(Submission.content_type == "text", Submission.media_group_id.is_(None)),
+        )
         exact_match_conditions = []
         if candidate.origin_paste_id is not None:
             # Confession pastes use the Telegram storage message as their
@@ -733,9 +748,11 @@ class SchedulerService:
                 select(func.count())
                 .select_from(ContentItem)
                 .join(PublicationLog, PublicationLog.content_item_id == ContentItem.id)
+                .outerjoin(Submission, Submission.id == ContentItem.origin_submission_id)
                 .where(
                     PublicationLog.channel_id == channel_id,
                     PublicationLog.publish_status == PublicationStatus.SENT,
+                    text_only,
                     or_(*exact_match_conditions),
                 )
             )
@@ -747,9 +764,11 @@ class SchedulerService:
                 await session.execute(
                     select(ContentItem)
                     .join(PublicationLog, PublicationLog.content_item_id == ContentItem.id)
+                    .outerjoin(Submission, Submission.id == ContentItem.origin_submission_id)
                     .where(
                         PublicationLog.channel_id == channel_id,
                         PublicationLog.publish_status == PublicationStatus.SENT,
+                        text_only,
                     )
                     .order_by(desc(PublicationLog.published_at))
                     .limit(25)
@@ -762,6 +781,46 @@ class SchedulerService:
             if similarity_score(candidate.normalized_text, recent.normalized_text) >= settings.similarity_threshold:
                 return True
         return False
+
+    async def _is_duplicate_media_for_channel(
+        self,
+        session: AsyncSession,
+        channel_id: int,
+        candidate: ContentItem,
+        submission: Submission,
+    ) -> bool:
+        same_source_conditions = [Submission.id == submission.id]
+        if submission.media_group_id:
+            same_source_conditions.append(
+                and_(
+                    Submission.channel_id == submission.channel_id,
+                    Submission.source_chat_id == submission.source_chat_id,
+                    Submission.media_group_id == submission.media_group_id,
+                )
+            )
+        elif submission.source_chat_id is not None and submission.source_message_id is not None:
+            same_source_conditions.append(
+                and_(
+                    Submission.channel_id == submission.channel_id,
+                    Submission.source_chat_id == submission.source_chat_id,
+                    Submission.source_message_id == submission.source_message_id,
+                )
+            )
+
+        query = (
+            select(func.count())
+            .select_from(ContentItem)
+            .join(PublicationLog, PublicationLog.content_item_id == ContentItem.id)
+            .join(Submission, Submission.id == ContentItem.origin_submission_id)
+            .where(
+                PublicationLog.channel_id == channel_id,
+                PublicationLog.publish_status.in_([PublicationStatus.SCHEDULED, PublicationStatus.SENT]),
+                or_(*same_source_conditions),
+            )
+        )
+        if candidate.id is not None:
+            query = query.where(ContentItem.id != candidate.id)
+        return bool(await session.scalar(query))
 
     def _channel_day_bounds(self, timezone_name: str, dt_utc: datetime) -> tuple[datetime, datetime]:
         tz = ZoneInfo(timezone_name)

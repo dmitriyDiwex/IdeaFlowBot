@@ -16,6 +16,7 @@ from src.editorial.models.review import Review
 from src.editorial.models.submission import Submission
 from src.editorial.services.moderation_case_service import ModerationCaseService
 from src.editorial.services.tag_service import TagService
+from src.editorial.utils.media import build_media_fingerprint, is_media_submission
 from src.editorial.utils.text import clean_text, compute_raw_text_hash, compute_text_hash, normalize_text
 
 
@@ -97,6 +98,9 @@ class ModerationService:
         group_size: int,
         text_value: str,
     ) -> tuple[str, str]:
+        if is_media_submission(submission):
+            return build_media_fingerprint(submission)
+
         normalized = normalize_text(text_value)
         text_hash = compute_text_hash(text_value)
         if normalized and text_hash:
@@ -106,12 +110,7 @@ class ModerationService:
         if cleaned_text and submission.content_type == "text":
             return cleaned_text, compute_raw_text_hash(cleaned_text) or ""
 
-        message_ref = submission.media_group_id or str(submission.source_message_id or submission.id)
-        fingerprint = (
-            f"telegram media {submission.content_type} "
-            f"{submission.channel_id} {submission.source_chat_id or 0} {message_ref} {group_size}"
-        )
-        return fingerprint, compute_text_hash(fingerprint) or ""
+        return build_media_fingerprint(submission)
 
     @staticmethod
     def _template_key_for_submission(submission: Submission) -> str:
