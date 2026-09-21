@@ -17,6 +17,7 @@ from src.editorial.models.enums import ContentItemStatus, ReviewDecision, Submis
 from src.editorial.models.mcp_moderation import McpModerationAction
 from src.editorial.models.moderation_case import ModerationCase
 from src.editorial.models.submission import Submission
+from src.editorial.services.legacy_audit import LEGACY_DELAYED_AUDIT_TEMPLATE_KEY
 from src.editorial.services.moderation import ModerationService
 from src.editorial.services.moderation_case_service import MODERATION_REJECTED, ModerationCaseService
 
@@ -472,7 +473,13 @@ class McpModerationService:
             submission_ids = [item.id for item in related]
             content_item = await session.scalar(
                 select(ContentItem)
-                .where(ContentItem.origin_submission_id.in_(submission_ids))
+                .where(
+                    ContentItem.origin_submission_id.in_(submission_ids),
+                    or_(
+                        ContentItem.template_key.is_(None),
+                        ContentItem.template_key != LEGACY_DELAYED_AUDIT_TEMPLATE_KEY,
+                    ),
+                )
                 .order_by(ContentItem.created_at.desc())
                 .limit(1)
             )

@@ -191,6 +191,20 @@ class TelegramEditorialActions:
                 ).scalars().all()
             )
 
+    async def list_profile_channels(self) -> list[Channel]:
+        """Return every active channel that can share a settings profile."""
+        await self.sync_channel_activity_from_bindings()
+        async with session_factory() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(Channel)
+                        .where(Channel.is_active.is_(True))
+                        .order_by(Channel.id.asc())
+                    )
+                ).scalars().all()
+            )
+
     async def get_channel(self, channel_id: int) -> Channel | None:
         async with session_factory() as session:
             return await self.channel_service.get_channel(session, channel_id)
@@ -323,13 +337,19 @@ class TelegramEditorialActions:
 
     async def deactivate_channel_by_tg_channel_id(self, tg_channel_id: int) -> bool:
         async with session_factory() as session:
-            channel = await self.channel_service.set_channel_active_by_tg_id(
-                session=session,
-                tg_channel_id=tg_channel_id,
-                is_active=False,
+            channel = await session.scalar(
+                select(Channel).where(Channel.tg_channel_id == tg_channel_id).limit(1)
             )
             if channel is None:
                 return False
+
+            # A confession channel is still connected through the shared
+            # confession publisher when its suggestion bot is removed.
+            if channel.content_family == ContentFamily.CONFESSION.value:
+                await session.commit()
+                return True
+
+            channel.is_active = False
 
             await session.execute(
                 sql_update(PublicationLog)

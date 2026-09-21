@@ -497,11 +497,13 @@ class PublisherService:
                     raise ValueError("Confession paste belongs to a different storage chat")
                 return publisher.bot_api_token
 
-        if getattr(channel, "content_family", None) == ContentFamily.CONFESSION.value:
-            raise ValueError("Confession channel can only publish Telegram-copy confession pastes")
-
         binding = await self.legacy_reader.get_bot_binding(channel.tg_channel_id)
         if binding is None:
+            if getattr(channel, "content_family", None) == ContentFamily.CONFESSION.value:
+                raise ValueError(
+                    "Suggestion bot binding for confession channel "
+                    f"{channel.tg_channel_id} not found"
+                )
             raise ValueError(f"Legacy bot binding for channel {channel.tg_channel_id} not found")
         return binding.bot_api_token
 

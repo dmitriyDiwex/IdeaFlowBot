@@ -6,7 +6,7 @@ import pytest
 
 from src.editorial.models.channel import Channel
 from src.editorial.models.content import ContentItem
-from src.editorial.models.enums import ContentItemStatus, ContentSourceType, PublicationStatus
+from src.editorial.models.enums import ContentFamily, ContentItemStatus, ContentSourceType, PublicationStatus
 from src.editorial.models.publication import PublicationLog
 from src.editorial.services.publisher import PublisherService
 from src.editorial.services.scheduler import SchedulerService
@@ -75,6 +75,29 @@ async def test_scheduled_paste_yields_its_slot_to_approved_live_content() -> Non
     assert live_item.scheduled_for == log_item.scheduled_for
     assert paste_item.status == ContentItemStatus.APPROVED
     assert paste_item.scheduled_for is None
+
+
+@pytest.mark.asyncio
+async def test_confession_paste_yields_its_slot_to_approved_confession() -> None:
+    now = datetime(2026, 8, 27, 13, 23, tzinfo=timezone.utc)
+    log_item, paste_item, channel = _scheduled_paste(now)
+    channel.content_family = ContentFamily.CONFESSION.value
+    live_item = _approved_submission(channel.id)
+    service = SchedulerService()
+    service._pick_live_candidate = AsyncMock(return_value=live_item)
+
+    replacement = await service.replace_scheduled_paste_with_live_candidate(
+        SimpleNamespace(),
+        log_item=log_item,
+        scheduled_item=paste_item,
+        channel=channel,
+        eligible_at=now,
+    )
+
+    assert replacement is live_item
+    assert log_item.content_item_id == live_item.id
+    assert live_item.status == ContentItemStatus.SCHEDULED
+    assert paste_item.status == ContentItemStatus.APPROVED
 
 
 @pytest.mark.asyncio

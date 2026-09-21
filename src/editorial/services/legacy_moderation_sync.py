@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -342,6 +342,158 @@ class LegacyModerationSyncService:
             await session.commit()
             return True
 
+    async def claim_legacy_publication(
+        self,
+        *,
+        channel_tg_id: int,
+        review_chat_id: int,
+        review_message_id: int,
+    ) -> bool:
+        """Reserve a review card before Telegram receives a publish call.
+
+        The reservation is committed first. MCP moderation and concurrent
+        legacy callbacks therefore see the submission as already handled
+        while the Telegram request is in flight.
+        """
+        async with session_factory() as session:
+            row = await self.legacy_reader.find_sender_row_by_review_message(
+                channel_id=channel_tg_id,
+                review_chat_id=review_chat_id,
+                review_message_id=review_message_id,
+            )
+            if row is None:
+                raise ValueError("Legacy review message is not linked to a submission")
+
+            submission = await self.importer.ensure_submission_for_legacy_row(session, row)
+            if submission is None:
+                raise ValueError("Legacy review message could not be imported")
+
+            locked_submission = await session.scalar(
+                select(Submission)
+                .where(Submission.id == submission.id)
+                .with_for_update()
+            )
+            if locked_submission is not None:
+                submission = locked_submission
+
+            related = await self.moderation.get_related_submissions(session, submission)
+            submission_ids = [item.id for item in related]
+            text_hashes = {
+                item.text_hash for item in related
+                if getattr(item, "text_hash", None)
+            }
+            audit_item = await self._get_legacy_delayed_audit_item(session, submission)
+            if audit_item is not None:
+                log_item = await self._get_legacy_delayed_audit_log(session, audit_item.id)
+                if audit_item.status in {
+                    ContentItemStatus.PENDING_REVIEW,
+                    ContentItemStatus.APPROVED,
+                    ContentItemStatus.SCHEDULED,
+                    ContentItemStatus.PUBLISHED,
+                } or (
+                    log_item is not None
+                    and log_item.publish_status in {
+                        PublicationStatus.SCHEDULED,
+                        PublicationStatus.SENT,
+                    }
+                ):
+                    await session.commit()
+                    return False
+
+            identity_conditions = [ContentItem.origin_submission_id.in_(submission_ids)]
+            if text_hashes:
+                identity_conditions.append(ContentItem.text_hash.in_(text_hashes))
+
+            conflicting_item_id = await session.scalar(
+                select(ContentItem.id)
+                .where(
+                    ContentItem.channel_id == submission.channel_id,
+                    or_(
+                        *identity_conditions,
+                    ),
+                    or_(
+                        ContentItem.template_key.is_(None),
+                        ContentItem.template_key != LEGACY_DELAYED_AUDIT_TEMPLATE_KEY,
+                    ),
+                    ContentItem.status.in_(
+                        {
+                            ContentItemStatus.PENDING_REVIEW,
+                            ContentItemStatus.APPROVED,
+                            ContentItemStatus.SCHEDULED,
+                            ContentItemStatus.PUBLISHED,
+                        }
+                    ),
+                )
+                .limit(1)
+            )
+            if conflicting_item_id is not None:
+                await session.commit()
+                return False
+
+            await self._upsert_legacy_delayed_audit(
+                session=session,
+                submission=submission,
+                scheduled_for=datetime.now(timezone.utc),
+                moderator_note="Handled in legacy moderation: publication claimed",
+            )
+            return True
+
+    async def release_legacy_publication_claim(
+        self,
+        *,
+        channel_tg_id: int,
+        review_chat_id: int,
+        review_message_id: int,
+        error_text: str,
+    ) -> bool:
+        """Release a reservation after a definite pre-delivery failure."""
+        async with session_factory() as session:
+            row = await self.legacy_reader.find_sender_row_by_review_message(
+                channel_id=channel_tg_id,
+                review_chat_id=review_chat_id,
+                review_message_id=review_message_id,
+            )
+            if row is None:
+                return False
+
+            submission = await self.importer.ensure_submission_for_legacy_row(session, row)
+            if submission is None:
+                return False
+
+            locked_submission = await session.scalar(
+                select(Submission)
+                .where(Submission.id == submission.id)
+                .with_for_update()
+            )
+            if locked_submission is not None:
+                submission = locked_submission
+
+            audit_item = await self._get_legacy_delayed_audit_item(session, submission)
+            if audit_item is None or audit_item.status == ContentItemStatus.PUBLISHED:
+                await session.commit()
+                return False
+
+            log_item = await self._get_legacy_delayed_audit_log(session, audit_item.id)
+            if log_item is not None and log_item.publish_status == PublicationStatus.SENT:
+                await session.commit()
+                return False
+
+            audit_item.status = ContentItemStatus.REJECTED
+            audit_item.scheduled_for = None
+            if log_item is not None:
+                log_item.publish_status = PublicationStatus.CANCELLED
+                log_item.retry_after = None
+                log_item.error_text = f"Legacy publication claim released: {error_text}"[:4000]
+
+            related = await self.moderation.get_related_submissions(session, submission)
+            for item in related:
+                item.status = SubmissionStatus.NEW
+                item.reviewed_at = None
+                item.moderator_note = f"Legacy publication failed before delivery: {error_text}"[:4000]
+
+            await session.commit()
+            return True
+
     async def mark_legacy_delayed_published(
         self,
         *,
@@ -350,6 +502,27 @@ class LegacyModerationSyncService:
         review_message_id: int,
         telegram_message_id: int | None = None,
     ) -> bool:
+        return await self.mark_legacy_published(
+            channel_tg_id=channel_tg_id,
+            review_chat_id=review_chat_id,
+            review_message_id=review_message_id,
+            telegram_message_id=telegram_message_id,
+            moderator_note="Handled in legacy moderation: delayed published",
+            moderation_action="publish_delayed",
+        )
+
+    async def mark_legacy_published(
+        self,
+        *,
+        channel_tg_id: int,
+        review_chat_id: int,
+        review_message_id: int,
+        telegram_message_id: int | None,
+        moderator_note: str = "Handled in legacy moderation: published",
+        reviewer_id: int | None = None,
+        moderation_action: str = "publish_now",
+    ) -> bool:
+        """Finalize a legacy publication in the shared editorial ledger."""
         async with session_factory() as session:
             row = await self.legacy_reader.find_sender_row_by_review_message(
                 channel_id=channel_tg_id,
@@ -369,7 +542,7 @@ class LegacyModerationSyncService:
                     session=session,
                     submission=submission,
                     scheduled_for=datetime.now(timezone.utc),
-                    moderator_note="Handled in legacy moderation: delayed published",
+                    moderator_note=moderator_note,
                 )
 
             now = datetime.now(timezone.utc)
@@ -392,13 +565,24 @@ class LegacyModerationSyncService:
             log_item.publish_status = PublicationStatus.SENT
             log_item.published_at = now
             log_item.telegram_message_id = telegram_message_id
+            log_item.retry_after = None
             log_item.error_text = None
 
             related = await self.moderation.get_related_submissions(session, submission)
             for item in related:
                 item.status = SubmissionStatus.CONTENT_CREATED
                 item.reviewed_at = now
-                item.moderator_note = "Handled in legacy moderation: delayed published"
+                item.moderator_note = moderator_note
+
+            if reviewer_id is not None:
+                await self.moderation_cases.record_submission_decision(
+                    session,
+                    submission_id=submission.id,
+                    moderator_id=reviewer_id,
+                    decision="approved",
+                    source="legacy",
+                    action=moderation_action,
+                )
 
             await session.commit()
             return True
@@ -423,6 +607,7 @@ class LegacyModerationSyncService:
                 template_key=LEGACY_DELAYED_AUDIT_TEMPLATE_KEY,
                 tone_key="legacy_moderation",
                 scheduled_for=scheduled_for,
+                commit=False,
             )
 
         audit_item.status = ContentItemStatus.SCHEDULED
@@ -514,7 +699,13 @@ class LegacyModerationSyncService:
         submission_ids = [item.id for item in related]
         return await session.scalar(
             select(ContentItem)
-            .where(ContentItem.origin_submission_id.in_(submission_ids))
+            .where(
+                ContentItem.origin_submission_id.in_(submission_ids),
+                or_(
+                    ContentItem.template_key.is_(None),
+                    ContentItem.template_key != LEGACY_DELAYED_AUDIT_TEMPLATE_KEY,
+                ),
+            )
             .order_by(ContentItem.created_at.desc())
             .limit(1)
         )

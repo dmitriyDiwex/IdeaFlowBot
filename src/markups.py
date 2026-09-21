@@ -520,9 +520,10 @@ class MarkupButton:
             is_anon,
             channel_title=None,
             media_group: LegacyMediaGroupReference | None = None,
-    ):
+    ) -> int:
         try:
             markup_post = None
+            published_message_id: int | None = None
 
             user_info = await self.bot.get_chat(call.data.split(";")[1])
             logger.info(f"send post: {channel_username}, {user_info.id, user_info.username}")
@@ -556,52 +557,65 @@ class MarkupButton:
                 copied_message_ids = [int(item.message_id) for item in copied_messages]
                 if not copied_message_ids:
                     raise RuntimeError("Telegram returned no copied media group messages")
+                published_message_id = copied_message_ids[0]
                 caption_index = min(media_group.caption_index, len(copied_message_ids) - 1)
                 published_caption_message_id = copied_message_ids[caption_index]
 
-                if add_signature:
-                    signature_html = publication_signature_html(
-                        title=channel_title,
-                        channel_ref=channel_username,
-                    )
-                    await self.bot.edit_message_caption(
-                        chat_id=channel_id,
-                        message_id=published_caption_message_id,
-                        caption=format_publication_html(
-                            media_group.caption,
-                            signature_html=signature_html,
-                        ),
-                        parse_mode="HTML",
-                        reply_markup=markup_post,
-                    )
-                elif markup_post is not None:
-                    await self.bot.edit_message_reply_markup(
-                        chat_id=channel_id,
-                        message_id=published_caption_message_id,
-                        reply_markup=markup_post,
+                try:
+                    if add_signature:
+                        signature_html = publication_signature_html(
+                            title=channel_title,
+                            channel_ref=channel_username,
+                        )
+                        await self.bot.edit_message_caption(
+                            chat_id=channel_id,
+                            message_id=published_caption_message_id,
+                            caption=format_publication_html(
+                                media_group.caption,
+                                signature_html=signature_html,
+                            ),
+                            parse_mode="HTML",
+                            reply_markup=markup_post,
+                        )
+                    elif markup_post is not None:
+                        await self.bot.edit_message_reply_markup(
+                            chat_id=channel_id,
+                            message_id=published_caption_message_id,
+                            reply_markup=markup_post,
+                        )
+                except Exception as caption_ex:
+                    # The album already exists in the destination channel.
+                    # Retrying it to repair only the caption would duplicate it.
+                    logger.error(
+                        "Copied legacy media group as message {}, but failed to update its caption/markup; "
+                        "treating the copy as sent: {}",
+                        published_message_id,
+                        caption_ex,
                     )
             elif not add_signature:
-                await self.bot.copy_message(
+                copied_message = await self.bot.copy_message(
                     chat_id=channel_id,
                     from_chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
                     reply_markup=markup_post,
                 )
+                published_message_id = int(copied_message.message_id)
             else:
                 signature_html = publication_signature_html(
                     title=channel_title,
                     channel_ref=channel_username,
                 )
                 if call.message.content_type == "text":
-                    await self.bot.send_message(
+                    sent_message = await self.bot.send_message(
                         chat_id=channel_id,
                         text=format_publication_html(call.message.text, signature_html=signature_html),
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                         reply_markup=markup_post,
                     )
+                    published_message_id = int(sent_message.message_id)
                 else:
-                    await self.bot.copy_message(
+                    copied_message = await self.bot.copy_message(
                         chat_id=channel_id,
                         from_chat_id=call.message.chat.id,
                         message_id=call.message.message_id,
@@ -609,6 +623,7 @@ class MarkupButton:
                         parse_mode="HTML",
                         reply_markup=markup_post,
                     )
+                    published_message_id = int(copied_message.message_id)
             # The channel publication has already succeeded at this point. A
             # temporary failure while updating the moderation markup must not
             # turn that success into a delayed retry and duplicate the post.
@@ -623,8 +638,10 @@ class MarkupButton:
                     "Post was published, but moderation markup update failed: {}",
                     markup_ex,
                 )
+            if published_message_id is None:
+                raise RuntimeError("Telegram returned no published message id")
             logger.info("send post success")
-            return True
+            return published_message_id
         except Exception as ex:
             logger.error(ex)
             try:

@@ -1,0 +1,11 @@
+# Copy this file to .codex/config.toml and replace the URL if Codex does not
+# run on the same host as Docker. Keep the token in the environment, not here.
+[mcp_servers.ideaflow]
+url = "http://127.0.0.1:8082/mcp"
+bearer_token_env_var = "IDEAFLOW_MCP_TOKEN"
+enabled = true
+required = false
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled_tools = ["list_proposal_queues", "list_pending_submissions", "get_submission", "list_human_moderation_examples", "apply_moderation_batch", "verify_moderation_batch"]

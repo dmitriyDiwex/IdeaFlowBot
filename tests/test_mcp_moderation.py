@@ -89,6 +89,9 @@ async def test_approve_uses_atomic_moderation_calls_and_ai_source():
     assert submission.status == SubmissionStatus.CONTENT_CREATED
     assert submission.moderator_note.startswith("Codex MCP:")
     session.flush.assert_awaited()
+    content_query = str(session.scalar.await_args.args[0])
+    assert "content_items.template_key IS NULL" in content_query
+    assert "content_items.template_key !=" in content_query
 
 
 @pytest.mark.asyncio

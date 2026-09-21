@@ -602,25 +602,50 @@ class SubBot:
                     if blocked_until is not None:
                         await self._warn_publication_blocked(call, blocked_until)
                         return
-                    await self._safe_answer_callback(call)
                     logger.debug(sender_id)
                     info_sender = await self.sup_bot.get_chat(sender_id)
                     logger.debug(info_sender)
                     if info_sender.username is None:
                         is_anon = False
                     logger.debug(self.bot_info)
-                    await utils_func.save_post(
-                        call,
-                        self.channel_id,
-                        info_sender,
-                        self.bot_info.username,
-                    )
                     media_group = await self._get_review_media_group(
                         review_chat_id=call.message.chat.id,
                         review_message_id=call.message.message_id,
                     )
                     try:
-                        legacy_sent = await asyncio.wait_for(
+                        publication_claimed = await self.legacy_moderation_sync.claim_legacy_publication(
+                            channel_tg_id=self.channel_id,
+                            review_chat_id=call.message.chat.id,
+                            review_message_id=call.message.message_id,
+                        )
+                    except Exception as ex:
+                        logger.error(
+                            "Refusing legacy publication because the editorial claim failed for message {}: {}",
+                            call.message.message_id,
+                            ex,
+                        )
+                        await self._safe_answer_callback(
+                            call,
+                            text="Не удалось зафиксировать публикацию. Сообщение не отправлено.",
+                            show_alert=True,
+                        )
+                        return
+                    if not publication_claimed:
+                        logger.warning(
+                            "Skipped duplicate legacy publication claim for review message {} in channel {}",
+                            call.message.message_id,
+                            self.channel_id,
+                        )
+                        await self._safe_answer_callback(
+                            call,
+                            text="Сообщение уже обработано или ожидает публикации.",
+                            show_alert=True,
+                        )
+                        return
+
+                    await self._safe_answer_callback(call)
+                    try:
+                        telegram_message_id = await asyncio.wait_for(
                             buttons_func.send_suggest(
                                 call,
                                 self.channel_signature_ref,
@@ -634,6 +659,19 @@ class SubBot:
                     except Exception as ex:
                         if not is_transient_telegram_error(ex):
                             logger.error("Permanent legacy publication error: {}", ex)
+                            try:
+                                await self.legacy_moderation_sync.release_legacy_publication_claim(
+                                    channel_tg_id=self.channel_id,
+                                    review_chat_id=call.message.chat.id,
+                                    review_message_id=call.message.message_id,
+                                    error_text=str(ex),
+                                )
+                            except Exception as release_ex:
+                                logger.error(
+                                    "Failed to release legacy publication claim for message {}: {}",
+                                    call.message.message_id,
+                                    release_ex,
+                                )
                             return
 
                         retry_at = int(datetime.now(timezone.utc).timestamp()) + settings.telegram_retry_delay_seconds
@@ -660,20 +698,46 @@ class SubBot:
                             ex,
                         )
                         return
-                    if legacy_sent:
+                    if telegram_message_id is not None:
+                        try:
+                            finalized = await self.legacy_moderation_sync.mark_legacy_published(
+                                channel_tg_id=self.channel_id,
+                                review_chat_id=call.message.chat.id,
+                                review_message_id=call.message.message_id,
+                                telegram_message_id=int(telegram_message_id),
+                                moderator_note="Handled in legacy moderation: published",
+                                reviewer_id=call.from_user.id,
+                                moderation_action="publish_now",
+                            )
+                            if not finalized:
+                                raise RuntimeError("Legacy publication audit row was not found")
+                        except Exception as finalize_ex:
+                            # The pre-send claim remains committed, so neither MCP nor
+                            # the slot publisher can publish the submission again.
+                            logger.error(
+                                "Legacy post {} was sent as Telegram message {}, but audit finalization failed: {}",
+                                call.message.message_id,
+                                telegram_message_id,
+                                finalize_ex,
+                            )
+                            await self.sup_bot.send_message(
+                                chat_id=call.message.chat.id,
+                                text=(
+                                    "Пост опубликован, но не удалось завершить запись аудита. "
+                                    "Повторная публикация заблокирована; проверьте журнал ошибок."
+                                ),
+                            )
+                        await utils_func.save_post(
+                            call,
+                            self.channel_id,
+                            info_sender,
+                            self.bot_info.username,
+                        )
                         self.anonym_send.discard(call.message.message_id)
                         await self.anonym_message_database.delete_posts({
                             "message_id": call.message.message_id,
                             "chat_id": call.message.chat.id,
                         })
-                        await self._sync_editorial_submission_status(
-                            review_message_id=call.message.message_id,
-                            status=SubmissionStatus.CONTENT_CREATED,
-                            moderator_note="Handled in legacy moderation: approved",
-                            reviewer_id=call.from_user.id,
-                            moderation_decision="approved",
-                            moderation_action="publish_now",
-                        )
                 case "approve_to_slot":
                     sender_id = int(call.data.split(";")[1])
                     try:
@@ -805,14 +869,57 @@ class SubBot:
                         return
                     await self._safe_answer_callback(call)
                     sender_info = await self.sup_bot.get_chat(int(call.data.split(";")[4]))
+                    try:
+                        publication_claimed = await self.legacy_moderation_sync.claim_legacy_publication(
+                            channel_tg_id=self.channel_id,
+                            review_chat_id=call.message.chat.id,
+                            review_message_id=call.message.message_id,
+                        )
+                    except Exception as ex:
+                        logger.error(
+                            "Refusing delayed legacy publication because the editorial claim failed "
+                            "for message {}: {}",
+                            call.message.message_id,
+                            ex,
+                        )
+                        await self.sup_bot.send_message(
+                            call.message.chat.id,
+                            "Не удалось зафиксировать публикацию. Отложенная отправка не создана.",
+                        )
+                        return
+                    if not publication_claimed:
+                        logger.warning(
+                            "Skipped duplicate delayed legacy publication claim for review message {} "
+                            "in channel {}",
+                            call.message.message_id,
+                            self.channel_id,
+                        )
+                        await self.sup_bot.send_message(
+                            call.message.chat.id,
+                            "Сообщение уже обработано или ожидает публикации.",
+                        )
+                        return
+                    if not await save_delayed_post(call):
+                        try:
+                            await self.legacy_moderation_sync.release_legacy_publication_claim(
+                                channel_tg_id=self.channel_id,
+                                review_chat_id=call.message.chat.id,
+                                review_message_id=call.message.message_id,
+                                error_text="legacy delayed publication was not scheduled",
+                            )
+                        except Exception as release_ex:
+                            logger.error(
+                                "Failed to release delayed legacy publication claim for message {}: {}",
+                                call.message.message_id,
+                                release_ex,
+                            )
+                        return
                     await utils_func.save_post(
                         call,
                         self.channel_id,
                         sender_info,
                         self.bot_info.username,
                     )
-                    if not await save_delayed_post(call):
-                        return
                     await self._sync_editorial_submission_status(
                         review_message_id=call.message.message_id,
                         status=SubmissionStatus.CONTENT_CREATED,
@@ -1319,26 +1426,36 @@ class SubBot:
             copied_message = copied_messages[0]
             caption_index = min(media_group.caption_index, len(copied_messages) - 1)
             published_caption_message = copied_messages[caption_index]
-            if add_signature:
-                signature_html = publication_signature_html(
-                    title=self.channel_title,
-                    channel_ref=self.channel_signature_ref,
-                )
-                await self.sup_bot.edit_message_caption(
-                    chat_id=self.channel_id,
-                    message_id=published_caption_message.message_id,
-                    caption=format_publication_html(
-                        media_group.caption,
-                        signature_html=signature_html,
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                )
-            elif markup is not None:
-                await self.sup_bot.edit_message_reply_markup(
-                    chat_id=self.channel_id,
-                    message_id=published_caption_message.message_id,
-                    reply_markup=markup,
+            try:
+                if add_signature:
+                    signature_html = publication_signature_html(
+                        title=self.channel_title,
+                        channel_ref=self.channel_signature_ref,
+                    )
+                    await self.sup_bot.edit_message_caption(
+                        chat_id=self.channel_id,
+                        message_id=published_caption_message.message_id,
+                        caption=format_publication_html(
+                            media_group.caption,
+                            signature_html=signature_html,
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                elif markup is not None:
+                    await self.sup_bot.edit_message_reply_markup(
+                        chat_id=self.channel_id,
+                        message_id=published_caption_message.message_id,
+                        reply_markup=markup,
+                    )
+            except Exception as caption_ex:
+                # copy_messages is not idempotent: after it returns, retrying the
+                # whole delayed job would publish the album a second time.
+                logger.error(
+                    "Copied delayed legacy media group as message {}, but failed to update its "
+                    "caption/markup; treating the copy as sent: {}",
+                    copied_message.message_id,
+                    caption_ex,
                 )
         elif not add_signature:
             copied_message = await self.sup_bot.copy_message(

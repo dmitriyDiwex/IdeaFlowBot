@@ -422,17 +422,11 @@ class ConfessionService:
         channel.title = (title or "").strip() or channel.title
         channel.is_active = True
         channel.content_family = ContentFamily.CONFESSION.value
-        channel.slot_jitter_minutes = 0
-        channel.auto_slots_enabled = False
-        channel.settings_profile_auto_enabled = False
-        channel.max_posts_per_day = 100
-        channel.max_generated_per_day = 0
-        channel.max_paste_per_day = 100
-        channel.same_paste_cooldown_days = 0
-        channel.min_ready_queue = 0
-        channel.prefer_real_ratio = 0
-        channel.allow_generated = False
-        channel.allow_pastes = True
+        # Confession channels use the same settings/profile and slot machinery
+        # as ordinary channels. Content-family filtering in PasteService keeps
+        # the two paste libraries isolated without a second settings system.
+        if channel.settings_profile_id is None:
+            channel.settings_profile_auto_enabled = True
         await session.commit()
         await session.refresh(channel)
         return channel

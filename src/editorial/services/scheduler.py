@@ -188,8 +188,7 @@ class SchedulerService:
         eligible_at: datetime,
     ) -> ContentItem:
         if (
-            channel.content_family == ContentFamily.CONFESSION.value
-            or scheduled_item.source_type != ContentSourceType.PASTE
+            scheduled_item.source_type != ContentSourceType.PASTE
             or scheduled_item.status != ContentItemStatus.SCHEDULED
             or log_item.publish_status != PublicationStatus.SCHEDULED
             or int(log_item.attempt_count or 0) != 0
@@ -537,9 +536,7 @@ class SchedulerService:
             .order_by(priority_case.asc(), ContentItem.priority.asc(), ContentItem.created_at.asc())
             .limit(50)
         )
-        if channel.content_family == ContentFamily.CONFESSION.value:
-            stmt = stmt.where(ContentItem.source_type == ContentSourceType.PASTE)
-        elif include_generated:
+        if include_generated:
             stmt = stmt.where(ContentItem.source_type == ContentSourceType.GENERATED)
         else:
             stmt = stmt.where(ContentItem.source_type != ContentSourceType.GENERATED)

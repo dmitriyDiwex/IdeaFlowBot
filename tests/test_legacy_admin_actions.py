@@ -130,7 +130,7 @@ async def test_successful_legacy_publication_is_not_retried_when_markup_update_f
         "Channel",
     )
 
-    assert sent is True
+    assert sent == 55
     bot.copy_message.assert_awaited_once()
     bot.edit_message_reply_markup.assert_awaited_once()
     bot.send_message.assert_not_awaited()

@@ -86,7 +86,7 @@ def build_confessions_menu(is_general_admin: bool) -> InlineKeyboardMarkup:
     if is_general_admin:
         markup.add(
             InlineKeyboardButton(
-                "Подключить саббота",
+                "Подключить бота паст",
                 callback_data="confessions:connect_publisher",
             ),
             InlineKeyboardButton(
@@ -177,11 +177,38 @@ def build_confession_channels_actions(
     return markup
 
 
-def build_confession_channel_actions(channel_id: int) -> InlineKeyboardMarkup:
+def build_confession_channel_actions(
+    channel_id: int,
+    *,
+    is_general_admin: bool = False,
+    has_suggestion_bot: bool = False,
+    notifications_enabled: bool = False,
+    moderation_feed_enabled: bool = False,
+) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=1)
+    if is_general_admin and not has_suggestion_bot:
+        markup.add(
+            InlineKeyboardButton(
+                "Подключить саббота-предложку",
+                callback_data=f"confession_channel:connect_suggestion:{channel_id}",
+            )
+        )
+    notify_label = "Выключить уведомления" if notifications_enabled else "Включить уведомления"
+    moderation_feed_label = (
+        "Выключить получение сообщений"
+        if moderation_feed_enabled
+        else "Включить получение сообщений"
+    )
     markup.add(
-        InlineKeyboardButton("Добавить слоты", callback_data=f"confession_channel:add_slot:{channel_id}"),
-        InlineKeyboardButton("Удалить слоты", callback_data=f"confession_channel:delete_slots:{channel_id}"),
+        InlineKeyboardButton(notify_label, callback_data=f"channel:notify_toggle:{channel_id}"),
+        InlineKeyboardButton(moderation_feed_label, callback_data=f"channel:feed_toggle:{channel_id}"),
+        InlineKeyboardButton("Настройка слотов", callback_data=f"channel:slots:{channel_id}"),
+        InlineKeyboardButton("Изменение параметров", callback_data=f"channel:params:{channel_id}"),
+        InlineKeyboardButton("Почему не публикует?", callback_data=f"channel:paste_diagnostics:{channel_id}"),
+        InlineKeyboardButton(
+            "Обновить профиль по подписчикам",
+            callback_data=f"confession_channel:profile_sync:{channel_id}",
+        ),
         InlineKeyboardButton(
             "Поставить рекламное окно",
             callback_data=f"confession_channel:add_ad_blackout:{channel_id}",

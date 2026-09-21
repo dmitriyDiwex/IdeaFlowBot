@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from src.editorial.models.enums import ContentFamily, PasteDeliveryMode, PasteStatus
+from src.editorial.models.channel import Channel
 from src.editorial.models.confession import ConfessionPasteCandidate
 from src.editorial.models.paste import PasteLibrary
 from src.editorial.services.confession_service import ConfessionService
@@ -139,11 +140,26 @@ def test_confession_candidate_confirmation_buttons() -> None:
 
 
 def test_confession_channel_actions_include_ad_blackouts() -> None:
-    markup = build_confession_channel_actions(15)
+    markup = build_confession_channel_actions(15, is_general_admin=True)
     callback_data = [button.callback_data for row in markup.keyboard for button in row]
 
+    assert "confession_channel:connect_suggestion:15" in callback_data
+    assert "channel:slots:15" in callback_data
+    assert "channel:params:15" in callback_data
+    assert "confession_channel:profile_sync:15" in callback_data
     assert "confession_channel:add_ad_blackout:15" in callback_data
     assert "confession_channel:delete_ad_blackout:15" in callback_data
+
+
+def test_connected_confession_suggestion_hides_connect_action() -> None:
+    markup = build_confession_channel_actions(
+        15,
+        is_general_admin=True,
+        has_suggestion_bot=True,
+    )
+    callback_data = [button.callback_data for row in markup.keyboard for button in row]
+
+    assert "confession_channel:connect_suggestion:15" not in callback_data
 
 
 def _channel_post(text: str, *, username: str | None = "confessions") -> SimpleNamespace:
@@ -244,6 +260,60 @@ async def test_confession_paste_is_published_with_copy_message() -> None:
         from_chat_id=-100500,
         message_id=77,
     )
+
+
+@pytest.mark.asyncio
+async def test_confession_submission_uses_its_suggestion_bot() -> None:
+    binding = SimpleNamespace(bot_api_token="456:suggestion")
+    legacy_reader = SimpleNamespace(get_bot_binding=AsyncMock(return_value=binding))
+    service = PublisherService(legacy_reader=legacy_reader)
+    session = SimpleNamespace(get=AsyncMock())
+    item = SimpleNamespace(origin_paste_id=None)
+    channel = SimpleNamespace(
+        tg_channel_id=-100700,
+        content_family=ContentFamily.CONFESSION.value,
+    )
+
+    token = await service._resolve_publication_bot_token(session, item, channel)
+
+    assert token == "456:suggestion"
+    session.get.assert_not_awaited()
+    legacy_reader.get_bot_binding.assert_awaited_once_with(-100700)
+
+
+@pytest.mark.asyncio
+async def test_ensure_confession_channel_preserves_shared_profile_settings() -> None:
+    channel = Channel(
+        tg_channel_id=-100700,
+        short_code="confession_existing",
+        content_family=ContentFamily.CONFESSION.value,
+        settings_profile_id=9,
+        settings_profile_auto_enabled=False,
+        slot_jitter_minutes=17,
+        max_posts_per_day=8,
+        max_paste_per_day=3,
+        allow_generated=True,
+    )
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=channel),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+
+    result = await ConfessionService().ensure_channel(
+        session,
+        tg_channel_id=-100700,
+        title="Признавашки",
+        username="confessions",
+    )
+
+    assert result is channel
+    assert channel.settings_profile_id == 9
+    assert channel.settings_profile_auto_enabled is False
+    assert channel.slot_jitter_minutes == 17
+    assert channel.max_posts_per_day == 8
+    assert channel.max_paste_per_day == 3
+    assert channel.allow_generated is True
 
 
 @pytest.mark.asyncio

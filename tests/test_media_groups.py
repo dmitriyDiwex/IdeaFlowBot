@@ -127,13 +127,61 @@ async def test_legacy_approval_publishes_album_with_copy_messages(monkeypatch) -
         media_group=media_group,
     )
 
-    assert sent is True
+    assert sent == 701
     bot.copy_messages.assert_awaited_once_with(
         chat_id=-10077,
         from_chat_id=1001,
         message_ids=[11, 12],
     )
     bot.copy_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_album_is_not_retried_after_post_copy_caption_failure(monkeypatch) -> None:
+    bot = SimpleNamespace(
+        token="1:test",
+        get_chat=AsyncMock(return_value=SimpleNamespace(id=1001, username="author")),
+        copy_messages=AsyncMock(
+            return_value=[SimpleNamespace(message_id=701), SimpleNamespace(message_id=702)]
+        ),
+        copy_message=AsyncMock(),
+        edit_message_caption=AsyncMock(side_effect=TimeoutError("timed out")),
+        edit_message_reply_markup=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.markups.should_add_publication_signature",
+        AsyncMock(return_value=True),
+    )
+    call = SimpleNamespace(
+        data="send_suggest;1001",
+        message=SimpleNamespace(
+            message_id=503,
+            chat=SimpleNamespace(id=-10055),
+            content_type="text",
+            text="Media group controls",
+            caption=None,
+        ),
+    )
+    media_group = LegacyMediaGroupReference(
+        source_chat_id=1001,
+        source_message_ids=[11, 12],
+        caption="Album caption",
+        caption_index=0,
+    )
+
+    sent = await MarkupButton(bot).send_suggest(
+        call,
+        "@channel",
+        -10077,
+        False,
+        "Channel",
+        media_group=media_group,
+    )
+
+    assert sent == 701
+    bot.copy_messages.assert_awaited_once()
+    bot.edit_message_caption.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -179,6 +227,54 @@ async def test_legacy_delayed_publication_copies_album_from_original_messages(mo
         message_ids=[11, 12],
     )
     bot.copy_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_delayed_album_is_finalized_after_caption_update_failure(monkeypatch) -> None:
+    media_group = LegacyMediaGroupReference(
+        source_chat_id=1001,
+        source_message_ids=[11, 12],
+        caption="Album caption",
+        caption_index=0,
+    )
+    copied_messages = [SimpleNamespace(message_id=701), SimpleNamespace(message_id=702)]
+    bot = SimpleNamespace(
+        token="1:test",
+        copy_messages=AsyncMock(return_value=copied_messages),
+        copy_message=AsyncMock(),
+        edit_message_caption=AsyncMock(side_effect=TimeoutError("timed out")),
+        edit_message_reply_markup=AsyncMock(),
+        get_chat=AsyncMock(return_value=SimpleNamespace(username="author")),
+    )
+    subbot = SubBot.__new__(SubBot)
+    subbot.sup_bot = bot
+    subbot.channel_id = -10077
+    subbot.chat_suggest = -10055
+    subbot.channel_username = "@channel"
+    subbot.channel_title = "Channel"
+    subbot.channel_signature_ref = "@channel"
+    subbot.delayed_message = {503: [100, 1001]}
+    subbot.anonym_send = set()
+    subbot._get_review_media_group = AsyncMock(return_value=media_group)
+    subbot.legacy_moderation_sync = SimpleNamespace(
+        mark_legacy_delayed_published=AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        "src.worker.should_add_publication_signature",
+        AsyncMock(return_value=True),
+    )
+
+    sent = await subbot.send_delayed_message(503, 1001)
+
+    assert sent is True
+    assert 503 not in subbot.delayed_message
+    bot.copy_messages.assert_awaited_once()
+    subbot.legacy_moderation_sync.mark_legacy_delayed_published.assert_awaited_once_with(
+        channel_tg_id=-10077,
+        review_chat_id=-10055,
+        review_message_id=503,
+        telegram_message_id=701,
+    )
 
 
 @pytest.mark.asyncio

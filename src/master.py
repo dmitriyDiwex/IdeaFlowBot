@@ -658,7 +658,12 @@ class MasterBot:
         end = min(start + PANEL_PAGE_SIZE, total_items)
         return start, end, page > 0, end < total_items
 
-    async def _fetch_channel_username(self, session: aiohttp.ClientSession, api_token: str, channel_id: int) -> str:
+    async def _fetch_channel_username(
+        self,
+        session: aiohttp.ClientSession,
+        api_token: str,
+        channel_id: int,
+    ) -> str | None:
         url = f"https://api.telegram.org/bot{api_token}/getchat?chat_id={channel_id}"
         request_kwargs = {}
         if settings.proxies["http"]:
@@ -667,7 +672,7 @@ class MasterBot:
             result = await response.json()
             if not result["ok"]:
                 raise HTTPError(result)
-            return result["result"]["username"]
+            return result["result"].get("username")
 
     async def _normalize_channel_username(self, channel_username: str) -> str:
         if "https" in channel_username:
@@ -676,14 +681,26 @@ class MasterBot:
             channel_username = "@" + channel_username
         return channel_username
 
-    async def _add_subbot_from_values(self, api_token: str, channel_username: str) -> tuple[str, int | None]:
-        channel_username = await self._normalize_channel_username(channel_username)
-        try:
-            channel_chat = await self.main_bot.get_chat(channel_username)
-            channel_id = channel_chat.id
-        except Exception:
-            logger.error("channel not found: {}", channel_username)
-            return f"Канал {channel_username} не найден.", None
+    async def _add_subbot_from_values(
+        self,
+        api_token: str,
+        channel_username: str | None = None,
+        *,
+        channel_tg_id: int | None = None,
+    ) -> tuple[str, int | None]:
+        if channel_tg_id is None:
+            if not channel_username:
+                return "Не указан канал для саббота.", None
+            channel_username = await self._normalize_channel_username(channel_username)
+            try:
+                channel_chat = await self.main_bot.get_chat(channel_username)
+                channel_id = int(channel_chat.id)
+            except Exception:
+                logger.error("channel not found: {}", channel_username)
+                return f"Канал {channel_username} не найден.", None
+        else:
+            channel_id = int(channel_tg_id)
+            channel_username = str(channel_id)
 
         bot = await SubBot.create(
             main_bot_username=self.bot_info.username,
@@ -708,18 +725,41 @@ class MasterBot:
                 None,
             )
 
+        confession_publisher = await self.editorial_actions.get_active_confession_publisher()
+        if confession_publisher is not None and bot.bot_info.id == confession_publisher.bot_user_id:
+            return (
+                "Бот паст признавашек нельзя одновременно использовать как предложку. "
+                "Создайте отдельного бота в BotFather.",
+                None,
+            )
+
         for item in await self.bots_database.get_bots_info():
             existing_username = str(item[1]).replace("@", "")
             existing_channel_id = int(item[2])
+            if existing_channel_id == channel_id and existing_username != bot_username:
+                return (
+                    f"К этому каналу уже привязан саббот @{existing_username}. "
+                    "Сначала удалите старую привязку в разделе «Сабботы».",
+                    None,
+                )
+            if existing_username == bot_username and existing_channel_id != channel_id:
+                return "\u042d\u0442\u043e\u0442 \u0441\u0430\u0431\u0431\u043e\u0442 \u0443\u0436\u0435 \u043f\u0440\u0438\u0432\u044f\u0437\u0430\u043d \u043a \u0434\u0440\u0443\u0433\u043e\u043c\u0443 \u043a\u0430\u043d\u0430\u043b\u0443.", None
             if existing_username != bot_username:
                 continue
-            if existing_channel_id != channel_id:
-                return "\u042d\u0442\u043e\u0442 \u0441\u0430\u0431\u0431\u043e\u0442 \u0443\u0436\u0435 \u043f\u0440\u0438\u0432\u044f\u0437\u0430\u043d \u043a \u0434\u0440\u0443\u0433\u043e\u043c\u0443 \u043a\u0430\u043d\u0430\u043b\u0443.", None
             editorial_channel = await self.editorial_actions.ensure_channel_for_tg_channel_id(channel_id)
             if not self._is_subbot_running(bot_username, channel_id):
                 self._configure_request_limit(len(self.bots_work) + 1)
                 await bot.run_bot()
                 self.bots_work.append(bot)
+            try:
+                await self.editorial_actions.sync_channel_profiles(channel_id=editorial_channel.id)
+            except Exception as exc:
+                logger.warning(
+                    "Existing subbot @{} was started, but profile sync for channel {} failed: {}",
+                    bot_username,
+                    editorial_channel.id,
+                    exc,
+                )
             return "\u041f\u0440\u0438\u0432\u044f\u0437\u043a\u0430 \u0441\u0430\u0431\u0431\u043e\u0442\u0430 \u0443\u0436\u0435 \u0431\u044b\u043b\u0430 \u0432 \u0431\u0430\u0437\u0435; \u043a\u0430\u043d\u0430\u043b \u0440\u0435\u0430\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d.", editorial_channel.id
         is_admin = await bot.check_admin(channel_id)
         if not is_admin:
@@ -740,6 +780,15 @@ class MasterBot:
         await bot.run_bot()
         self.bots_work.append(bot)
         editorial_channel = await self.editorial_actions.ensure_channel_for_tg_channel_id(channel_id)
+        try:
+            await self.editorial_actions.sync_channel_profiles(channel_id=editorial_channel.id)
+        except Exception as exc:
+            logger.warning(
+                "Subbot @{} was connected, but profile sync for channel {} failed: {}",
+                bot_username,
+                editorial_channel.id,
+                exc,
+            )
         return f"Саббот {bot.bot_info.username} подключен к {channel_username}.", editorial_channel.id
 
     async def _remove_subbot_from_values(self, username_bot: str, channel_id: int) -> str:
@@ -804,6 +853,16 @@ class MasterBot:
             if channel_id is None or getattr(bot, "channel_id", None) == channel_id:
                 return True
         return False
+
+    def _running_subbot_for_channel(self, tg_channel_id: int) -> SubBot | None:
+        return next(
+            (
+                bot
+                for bot in self.bots_work
+                if int(getattr(bot, "channel_id", 0)) == int(tg_channel_id)
+            ),
+            None,
+        )
 
     def _channel_label_from_runtime(self, tg_channel_id: int) -> str | None:
         for bot in self.bots_work:
@@ -1117,7 +1176,7 @@ class MasterBot:
         await self.main_bot.send_message(chat_id, "\n".join(lines))
 
     async def _send_profile_assign_channels_prompt(self, chat_id: int, profile_slug: str) -> None:
-        channels = await self.editorial_actions.list_channels()
+        channels = await self.editorial_actions.list_profile_channels()
         lines = [
             f"Выставление профиля {profile_slug}.",
             "",
@@ -1127,7 +1186,7 @@ class MasterBot:
             "all",
             "",
             f"Активных каналов: {len(channels)}",
-            "Используются id каналов из раздела 'Каналы и слоты'.",
+            "Используются id из разделов «Каналы и слоты» и «Признавашки → Паблики».",
             "",
             "Канал будет переведен в ручной режим: settings_profile_auto_enabled=false.",
         ]
@@ -1388,6 +1447,14 @@ class MasterBot:
 
         if not channel.is_active:
             await self.main_bot.send_message(chat_id, "\u041a\u0430\u043d\u0430\u043b \u043e\u0442\u0432\u044f\u0437\u0430\u043d \u0438 \u0441\u043a\u0440\u044b\u0442 \u0438\u0437 \u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0439 \u043f\u0430\u043d\u0435\u043b\u0438.")
+            return
+
+        if channel.content_family == ContentFamily.CONFESSION.value:
+            await self._show_confession_channel_slots(
+                chat_id,
+                channel_id,
+                user_id=user_id,
+            )
             return
 
         effective_user_id = user_id if user_id is not None else chat_id
@@ -2111,17 +2178,81 @@ class MasterBot:
             ),
         )
 
-    async def _show_confession_channel_slots(self, chat_id: int, channel_id: int) -> None:
+    async def _show_confession_channel_slots(
+        self,
+        chat_id: int,
+        channel_id: int,
+        user_id: int | None = None,
+    ) -> None:
         channel = await self.editorial_actions.get_channel(channel_id)
         if channel is None or channel.content_family != ContentFamily.CONFESSION.value:
             await self.main_bot.send_message(chat_id, "Паблик признавашек не найден.")
             return
         slots = await self.editorial_actions.list_channel_slots(channel_id)
         ad_blackouts = await self.editorial_actions.list_channel_ad_blackouts(channel_id)
-        lines = [f"Слоты для {self._confession_channel_label(channel)}:"]
+        settings_snapshot = await self.editorial_actions.get_channel_settings_snapshot(channel_id)
+        effective_user_id = user_id if user_id is not None else chat_id
+        notifications_enabled = await self.editorial_actions.is_channel_notifications_enabled(
+            channel_id,
+            effective_user_id,
+        )
+        moderation_feed_enabled = await self.editorial_actions.is_channel_moderation_feed_enabled(
+            channel_id,
+            effective_user_id,
+        )
+        binding = await self.legacy_reader.get_bot_binding(channel.tg_channel_id)
+        running_subbot = self._running_subbot_for_channel(channel.tg_channel_id)
+        if binding is None:
+            suggestion_status = "не подключена"
+        else:
+            suggestion_status = f"@{binding.bot_username.lstrip('@')}"
+            if running_subbot is None:
+                suggestion_status += " (ожидает запуска)"
+            elif running_subbot.chat_suggest is None:
+                suggestion_status += "; модер-чат не подключён"
+            else:
+                suggestion_status += f"; модер-чат {running_subbot.chat_suggest}"
+
+        summary_fields = {
+            "min_gap_minutes",
+            "slot_jitter_minutes",
+            "auto_slots_enabled",
+            "auto_slots_plan_time",
+            "auto_slots_window_start",
+            "auto_slots_window_end",
+            "auto_slots_replace_manual",
+            "settings_profile_auto_enabled",
+            "min_slots_per_day",
+            "max_posts_per_day",
+            "max_paste_per_day",
+            "same_paste_cooldown_days",
+            "allow_generated",
+            "allow_pastes",
+        }
+        summary_lines = [
+            f"{field_name} = {self._format_channel_setting_value(value)}"
+            for field_name, value in settings_snapshot
+            if field_name in summary_fields
+        ]
+        lines = [
+            f"Паблик признавашек: {self._confession_channel_label(channel)}",
+            f"tg_channel_id: {channel.tg_channel_id}",
+            f"Предложка: {suggestion_status}",
+            f"subscribers: {channel.subscriber_count if channel.subscriber_count is not None else 'unknown'}",
+            f"settings_profile_id: {channel.settings_profile_id or 'none'}",
+            "",
+            "Ключевые параметры:",
+            *summary_lines,
+            "",
+            "Слоты:",
+        ]
         if slots:
             lines.extend(
-                f"#{slot.id} {self._weekday_label(slot.weekday)} {slot.slot_time.strftime('%H:%M')}"
+                (
+                    f"#{slot.id} {self._weekday_label(slot.weekday)} "
+                    f"{slot.slot_time.strftime('%H:%M')}"
+                    f"{' auto' if getattr(slot, 'is_auto_managed', False) else ''}"
+                )
                 for slot in slots
             )
         else:
@@ -2133,7 +2264,13 @@ class MasterBot:
         await self.main_bot.send_message(
             chat_id,
             "\n".join(lines),
-            reply_markup=build_confession_channel_actions(channel_id),
+            reply_markup=build_confession_channel_actions(
+                channel_id,
+                is_general_admin=self._is_general_admin(effective_user_id),
+                has_suggestion_bot=binding is not None,
+                notifications_enabled=notifications_enabled,
+                moderation_feed_enabled=moderation_feed_enabled,
+            ),
         )
 
     async def _show_tags_menu(self, chat_id: int) -> None:
@@ -2432,6 +2569,40 @@ class MasterBot:
                 ),
             )
             await self._show_confessions_menu(message.chat.id)
+            return True
+
+        if action == "await_confession_suggestion_token":
+            channel_id = int(state["channel_id"])
+            if not self._is_general_admin(message.from_user.id if message.from_user else message.chat.id):
+                await self.main_bot.send_message(message.chat.id, "Только для генерального администратора.")
+                return True
+            channel = await self.editorial_actions.get_channel(channel_id)
+            if channel is None or channel.content_family != ContentFamily.CONFESSION.value:
+                await self.main_bot.send_message(message.chat.id, "Паблик признавашек не найден.")
+                return True
+            if not text_value:
+                self._set_user_state(message.chat.id, action, channel_id=channel_id)
+                await self.main_bot.send_message(message.chat.id, "Отправьте токен отдельного бота-предложки.")
+                return True
+            result_text, connected_channel_id = await self._add_subbot_from_values(
+                text_value,
+                channel_tg_id=channel.tg_channel_id,
+            )
+            await self.main_bot.send_message(message.chat.id, result_text)
+            if connected_channel_id is None:
+                self._set_user_state(message.chat.id, action, channel_id=channel_id)
+                return True
+            binding = await self.legacy_reader.get_bot_binding(channel.tg_channel_id)
+            bot_label = f"@{binding.bot_username.lstrip('@')}" if binding else "саббота"
+            await self.main_bot.send_message(
+                message.chat.id,
+                (
+                    f"Теперь добавьте {bot_label} администратором в чат модерации. "
+                    "В этот чат будут приходить сообщения из предложки; функциональность "
+                    "модерации и публикации такая же, как у подслушек."
+                ),
+            )
+            await self._show_confession_channel_slots(message.chat.id, channel_id)
             return True
 
         if action == "await_confession_add_channel":
@@ -2839,7 +3010,7 @@ class MasterBot:
             return True
 
         if action == "await_profile_assign_channels":
-            channels = await self.editorial_actions.list_channels()
+            channels = await self.editorial_actions.list_profile_channels()
             profile_slug = state.get("profile_slug")
             if not profile_slug:
                 self._clear_user_state(message.chat.id)
@@ -3701,7 +3872,61 @@ class MasterBot:
                 channel_id = int(value)
                 await self._safe_answer_callback(self.main_bot, call.id)
                 if action == "view":
-                    await self._show_confession_channel_slots(call.message.chat.id, channel_id)
+                    await self._show_confession_channel_slots(
+                        call.message.chat.id,
+                        channel_id,
+                        user_id=call.from_user.id,
+                    )
+                    return
+                if action == "connect_suggestion":
+                    if not self._is_general_admin(call.from_user.id):
+                        await self.main_bot.send_message(
+                            call.message.chat.id,
+                            "Только для генерального администратора.",
+                        )
+                        return
+                    channel = await self.editorial_actions.get_channel(channel_id)
+                    if channel is None or channel.content_family != ContentFamily.CONFESSION.value:
+                        await self.main_bot.send_message(call.message.chat.id, "Паблик признавашек не найден.")
+                        return
+                    binding = await self.legacy_reader.get_bot_binding(channel.tg_channel_id)
+                    if binding is not None:
+                        await self.main_bot.send_message(
+                            call.message.chat.id,
+                            f"Предложка уже подключена через @{binding.bot_username.lstrip('@')}.",
+                        )
+                        return
+                    self._set_user_state(
+                        call.message.chat.id,
+                        "await_confession_suggestion_token",
+                        channel_id=channel_id,
+                    )
+                    await self.main_bot.send_message(
+                        call.message.chat.id,
+                        (
+                            "1. Создайте отдельного бота-предложку в BotFather.\n"
+                            "2. Добавьте его администратором этого паблика.\n"
+                            "3. Отправьте сюда token бота.\n\n"
+                            "После подключения добавьте того же бота администратором в нужный чат модерации — "
+                            "туда будут пересылаться сообщения пользователей."
+                        ),
+                    )
+                    return
+                if action == "profile_sync":
+                    result = await self.editorial_actions.sync_channel_profiles(channel_id=channel_id)
+                    await self.main_bot.send_message(
+                        call.message.chat.id,
+                        (
+                            "Профиль обновлён по общей системе. "
+                            f"Обновлено подписчиков: {result.subscriber_counts_updated}; "
+                            f"изменено профилей: {result.profiles_changed}; ошибок: {result.failed}."
+                        ),
+                    )
+                    await self._show_confession_channel_slots(
+                        call.message.chat.id,
+                        channel_id,
+                        user_id=call.from_user.id,
+                    )
                     return
                 if action == "add_slot":
                     self._set_user_state(
@@ -4558,10 +4783,11 @@ class MasterBot:
                 for api_token, bot_username, channel_id, _id_row in bots_lst:
                     try:
                         channel_username = await self._fetch_channel_username(session, api_token, channel_id)
+                        channel_ref = f"@{channel_username}" if channel_username else str(channel_id)
                         bot = await SubBot.create(
                             main_bot_username=self.bot_info.username,
                             api_token_bot=api_token,
-                            channel_username="@" + channel_username,
+                            channel_username=channel_ref,
                             hello_msg=settings.hello_msg,
                             ban_usr_msg=settings.ban_msg,
                             send_post_msg=settings.send_post_msg,
