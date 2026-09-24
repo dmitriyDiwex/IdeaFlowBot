@@ -207,10 +207,13 @@ async def test_legacy_delayed_publication_copies_album_from_original_messages(mo
     subbot.channel_username = "@channel"
     subbot.channel_title = "Channel"
     subbot.channel_signature_ref = "@channel"
+    subbot.bot_info = SimpleNamespace(id=7)
     subbot.delayed_message = {503: [100, 1001]}
     subbot.anonym_send = set()
+    subbot.delayed_database = SimpleNamespace(delete_delayed_posts=AsyncMock())
     subbot._get_review_media_group = AsyncMock(return_value=media_group)
     subbot.legacy_moderation_sync = SimpleNamespace(
+        claim_legacy_delayed_delivery=AsyncMock(return_value=True),
         mark_legacy_delayed_published=AsyncMock(return_value=True)
     )
     monkeypatch.setattr(
@@ -253,10 +256,13 @@ async def test_legacy_delayed_album_is_finalized_after_caption_update_failure(mo
     subbot.channel_username = "@channel"
     subbot.channel_title = "Channel"
     subbot.channel_signature_ref = "@channel"
+    subbot.bot_info = SimpleNamespace(id=7)
     subbot.delayed_message = {503: [100, 1001]}
     subbot.anonym_send = set()
+    subbot.delayed_database = SimpleNamespace(delete_delayed_posts=AsyncMock())
     subbot._get_review_media_group = AsyncMock(return_value=media_group)
     subbot.legacy_moderation_sync = SimpleNamespace(
+        claim_legacy_delayed_delivery=AsyncMock(return_value=True),
         mark_legacy_delayed_published=AsyncMock(return_value=True)
     )
     monkeypatch.setattr(
@@ -275,6 +281,147 @@ async def test_legacy_delayed_album_is_finalized_after_caption_update_failure(mo
         review_message_id=503,
         telegram_message_id=701,
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_collectors_copy_one_delayed_post_only_once(monkeypatch) -> None:
+    bot = SimpleNamespace(
+        token="1:test",
+        copy_message=AsyncMock(return_value=SimpleNamespace(message_id=701)),
+        get_chat=AsyncMock(return_value=SimpleNamespace(username="author")),
+    )
+    delivery_claim = AsyncMock(side_effect=[True, False])
+    moderation_sync = SimpleNamespace(
+        claim_legacy_delayed_delivery=delivery_claim,
+        mark_legacy_delayed_published=AsyncMock(return_value=True),
+    )
+
+    def build_subbot():
+        subbot = SubBot.__new__(SubBot)
+        subbot.sup_bot = bot
+        subbot.bot_info = SimpleNamespace(id=7)
+        subbot.channel_id = -10077
+        subbot.chat_suggest = -10055
+        subbot.channel_username = "@channel"
+        subbot.channel_title = "Channel"
+        subbot.channel_signature_ref = "@channel"
+        subbot.delayed_message = {503: [100, 1001]}
+        subbot.anonym_send = set()
+        subbot.delayed_database = SimpleNamespace(delete_delayed_posts=AsyncMock())
+        subbot._get_review_media_group = AsyncMock(return_value=None)
+        subbot.legacy_moderation_sync = moderation_sync
+        return subbot
+
+    monkeypatch.setattr(
+        "src.worker.should_add_publication_signature",
+        AsyncMock(return_value=False),
+    )
+    first = build_subbot()
+    second = build_subbot()
+
+    results = await asyncio.gather(
+        first.send_delayed_message(503, 1001, 100),
+        second.send_delayed_message(503, 1001, 100),
+    )
+
+    assert sorted(results) == [False, True]
+    assert delivery_claim.await_count == 2
+    bot.copy_message.assert_awaited_once()
+    moderation_sync.mark_legacy_delayed_published.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delayed_copy_timeout_is_not_automatically_retried(monkeypatch) -> None:
+    bot = SimpleNamespace(
+        token="1:test",
+        copy_message=AsyncMock(side_effect=asyncio.TimeoutError("copy timed out")),
+        get_chat=AsyncMock(return_value=SimpleNamespace(username="author")),
+    )
+    moderation_sync = SimpleNamespace(
+        claim_legacy_delayed_delivery=AsyncMock(return_value=True),
+        mark_legacy_delayed_delivery_uncertain=AsyncMock(return_value=True),
+        release_legacy_publication_claim=AsyncMock(return_value=True),
+    )
+    subbot = SubBot.__new__(SubBot)
+    subbot.sup_bot = bot
+    subbot.bot_info = SimpleNamespace(id=7)
+    subbot.channel_id = -10077
+    subbot.chat_suggest = -10055
+    subbot.channel_username = "@channel"
+    subbot.channel_title = "Channel"
+    subbot.channel_signature_ref = "@channel"
+    subbot.delayed_message = {503: [100, 1001]}
+    subbot.anonym_send = set()
+    subbot.delayed_database = SimpleNamespace(delete_delayed_posts=AsyncMock())
+    subbot._get_review_media_group = AsyncMock(return_value=None)
+    subbot.legacy_moderation_sync = moderation_sync
+    monkeypatch.setattr(
+        "src.worker.should_add_publication_signature",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(asyncio.TimeoutError, match="copy timed out"):
+        await subbot.send_delayed_message(503, 1001, 100)
+
+    assert 503 not in subbot.delayed_message
+    moderation_sync.mark_legacy_delayed_delivery_uncertain.assert_awaited_once()
+    moderation_sync.release_legacy_publication_claim.assert_not_awaited()
+    subbot.delayed_database.delete_delayed_posts.assert_awaited_once()
+
+    retried = await subbot.send_delayed_message(503, 1001, 100)
+    assert retried is False
+    bot.copy_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_outer_delivery_timeout_is_recorded_as_ambiguous(monkeypatch) -> None:
+    never_returns = asyncio.Event()
+
+    async def blocked_copy(**_kwargs):
+        await never_returns.wait()
+
+    bot = SimpleNamespace(
+        token="1:test",
+        copy_message=AsyncMock(side_effect=blocked_copy),
+        get_chat=AsyncMock(return_value=SimpleNamespace(username="author")),
+    )
+    moderation_sync = SimpleNamespace(
+        claim_legacy_delayed_delivery=AsyncMock(return_value=True),
+        mark_legacy_delayed_delivery_uncertain=AsyncMock(return_value=True),
+        release_legacy_publication_claim=AsyncMock(return_value=True),
+    )
+    subbot = SubBot.__new__(SubBot)
+    subbot.sup_bot = bot
+    subbot.bot_info = SimpleNamespace(id=7)
+    subbot.channel_id = -10077
+    subbot.chat_suggest = -10055
+    subbot.channel_username = "@channel"
+    subbot.channel_title = "Channel"
+    subbot.channel_signature_ref = "@channel"
+    subbot.delayed_message = {503: [100, 1001]}
+    subbot.anonym_send = set()
+    subbot.delayed_database = SimpleNamespace(delete_delayed_posts=AsyncMock())
+    subbot._get_review_media_group = AsyncMock(return_value=None)
+    subbot.legacy_moderation_sync = moderation_sync
+    monkeypatch.setattr(
+        "src.worker.should_add_publication_signature",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            subbot.send_delayed_message(503, 1001, 100),
+            timeout=0.01,
+        )
+
+    moderation_sync.mark_legacy_delayed_delivery_uncertain.assert_awaited_once_with(
+        channel_tg_id=-10077,
+        review_chat_id=-10055,
+        review_message_id=503,
+        error_text="Telegram delivery was cancelled or timed out",
+    )
+    moderation_sync.release_legacy_publication_claim.assert_not_awaited()
+    assert 503 not in subbot.delayed_message
 
 
 @pytest.mark.asyncio

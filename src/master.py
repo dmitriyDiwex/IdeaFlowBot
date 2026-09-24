@@ -3388,12 +3388,6 @@ class MasterBot:
                 )
                 if not sent:
                     continue
-                await self.delayed_database.delete_delayed_posts(
-                    {
-                        "bot_id": bot,
-                        "message_id": message_id,
-                    }
-                )
             except Exception as ex:
                 logger.error(
                     "Failed to publish legacy delayed message {} for bot {}: {}",

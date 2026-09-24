@@ -171,6 +171,98 @@ async def test_definite_delivery_failure_releases_legacy_claim(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_delayed_delivery_claim_is_consumed_before_telegram_call(monkeypatch) -> None:
+    submission = SimpleNamespace(id=12, channel_id=7, text_hash="hash-12")
+    audit_item = SimpleNamespace(id=71, status=ContentItemStatus.SCHEDULED)
+    log_item = SimpleNamespace(
+        publish_status=PublicationStatus.SCHEDULED,
+        attempt_count=0,
+        last_attempt_at=None,
+        retry_after=datetime.now(timezone.utc),
+        error_text="pending",
+    )
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=submission),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.editorial.services.legacy_moderation_sync.session_factory",
+        lambda: _SessionContext(session),
+    )
+    service = _service(submission)
+    service._get_legacy_delayed_audit_item = AsyncMock(return_value=audit_item)
+    service._get_legacy_delayed_audit_log = AsyncMock(return_value=log_item)
+
+    first_claim = await service.claim_legacy_delayed_delivery(
+        channel_tg_id=-10077,
+        review_chat_id=-10055,
+        review_message_id=503,
+    )
+    second_claim = await service.claim_legacy_delayed_delivery(
+        channel_tg_id=-10077,
+        review_chat_id=-10055,
+        review_message_id=503,
+    )
+
+    assert first_claim is True
+    assert second_claim is False
+    assert log_item.attempt_count == 1
+    assert log_item.last_attempt_at is not None
+    assert log_item.retry_after is None
+    assert log_item.error_text == "Legacy delayed delivery claimed"
+    assert session.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_delayed_delivery_failure_is_held_without_retry(monkeypatch) -> None:
+    submission = SimpleNamespace(
+        id=12,
+        channel_id=7,
+        text_hash="hash-12",
+        status=SubmissionStatus.CONTENT_CREATED,
+        reviewed_at=datetime.now(timezone.utc),
+        moderator_note="claimed",
+    )
+    audit_item = SimpleNamespace(
+        id=71,
+        status=ContentItemStatus.SCHEDULED,
+        scheduled_for=datetime.now(timezone.utc),
+    )
+    log_item = SimpleNamespace(
+        publish_status=PublicationStatus.SCHEDULED,
+        retry_after=None,
+        error_text="Legacy delayed delivery claimed",
+    )
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=submission),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.editorial.services.legacy_moderation_sync.session_factory",
+        lambda: _SessionContext(session),
+    )
+    service = _service(submission)
+    service._get_legacy_delayed_audit_item = AsyncMock(return_value=audit_item)
+    service._get_legacy_delayed_audit_log = AsyncMock(return_value=log_item)
+
+    held = await service.mark_legacy_delayed_delivery_uncertain(
+        channel_tg_id=-10077,
+        review_chat_id=-10055,
+        review_message_id=503,
+        error_text="copyMessage exceeded 15 seconds",
+    )
+
+    assert held is True
+    assert audit_item.status == ContentItemStatus.HOLD
+    assert audit_item.scheduled_for is None
+    assert log_item.publish_status == PublicationStatus.FAILED
+    assert "automatic retry suppressed" in log_item.error_text
+    assert submission.status == SubmissionStatus.HOLD
+    assert "copyMessage exceeded" in submission.moderator_note
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_legacy_publication_is_written_to_shared_sent_log(monkeypatch) -> None:
     scheduled_for = datetime(2026, 9, 12, 12, 18, tzinfo=timezone.utc)
     submission = SimpleNamespace(

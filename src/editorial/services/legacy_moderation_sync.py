@@ -28,6 +28,9 @@ from src.editorial.services.moderation import ModerationService
 from src.editorial.services.moderation_case_service import ModerationCaseService
 
 
+LEGACY_DELAYED_DELIVERY_CLAIM_MARKER = "Legacy delayed delivery claimed"
+
+
 class LegacyModerationSyncService:
     def __init__(
         self,
@@ -494,6 +497,131 @@ class LegacyModerationSyncService:
             await session.commit()
             return True
 
+    async def claim_legacy_delayed_delivery(
+        self,
+        *,
+        channel_tg_id: int,
+        review_chat_id: int,
+        review_message_id: int,
+    ) -> bool:
+        """Claim one non-idempotent delayed Telegram delivery.
+
+        The claim is committed before Telegram is called. A second collector
+        process therefore observes ``attempt_count > 0`` and must not copy the
+        same review message again. An ambiguous transport failure intentionally
+        keeps the attempt consumed; retrying copyMessage cannot be made safe.
+        """
+        async with session_factory() as session:
+            row = await self.legacy_reader.find_sender_row_by_review_message(
+                channel_id=channel_tg_id,
+                review_chat_id=review_chat_id,
+                review_message_id=review_message_id,
+            )
+            if row is None:
+                raise ValueError("Legacy review message is not linked to a submission")
+
+            submission = await self.importer.ensure_submission_for_legacy_row(session, row)
+            if submission is None:
+                raise ValueError("Legacy review message could not be imported")
+
+            locked_submission = await session.scalar(
+                select(Submission)
+                .where(Submission.id == submission.id)
+                .with_for_update()
+            )
+            if locked_submission is not None:
+                submission = locked_submission
+
+            audit_item = await self._get_legacy_delayed_audit_item(session, submission)
+            if audit_item is None:
+                raise ValueError("Legacy delayed publication audit item is missing")
+
+            log_item = await self._get_legacy_delayed_audit_log(session, audit_item.id)
+            if log_item is None:
+                raise ValueError("Legacy delayed publication log is missing")
+
+            if (
+                audit_item.status != ContentItemStatus.SCHEDULED
+                or log_item.publish_status != PublicationStatus.SCHEDULED
+                or int(log_item.attempt_count or 0) > 0
+            ):
+                await session.commit()
+                return False
+
+            attempted_at = datetime.now(timezone.utc)
+            log_item.attempt_count = 1
+            log_item.last_attempt_at = attempted_at
+            log_item.retry_after = None
+            log_item.error_text = LEGACY_DELAYED_DELIVERY_CLAIM_MARKER
+            await session.commit()
+            return True
+
+    async def mark_legacy_delayed_delivery_uncertain(
+        self,
+        *,
+        channel_tg_id: int,
+        review_chat_id: int,
+        review_message_id: int,
+        error_text: str,
+    ) -> bool:
+        """Stop automatic retries when Telegram may already have copied a post."""
+        async with session_factory() as session:
+            row = await self.legacy_reader.find_sender_row_by_review_message(
+                channel_id=channel_tg_id,
+                review_chat_id=review_chat_id,
+                review_message_id=review_message_id,
+            )
+            if row is None:
+                return False
+
+            submission = await self.importer.ensure_submission_for_legacy_row(session, row)
+            if submission is None:
+                return False
+
+            locked_submission = await session.scalar(
+                select(Submission)
+                .where(Submission.id == submission.id)
+                .with_for_update()
+            )
+            if locked_submission is not None:
+                submission = locked_submission
+
+            audit_item = await self._get_legacy_delayed_audit_item(session, submission)
+            if audit_item is None:
+                return False
+
+            log_item = await self._get_legacy_delayed_audit_log(session, audit_item.id)
+            if (
+                audit_item.status == ContentItemStatus.PUBLISHED
+                or (
+                    log_item is not None
+                    and log_item.publish_status == PublicationStatus.SENT
+                )
+            ):
+                await session.commit()
+                return False
+
+            message = (
+                "Legacy delayed delivery outcome is uncertain; automatic retry suppressed: "
+                f"{error_text}"
+            )[:4000]
+            audit_item.status = ContentItemStatus.HOLD
+            audit_item.scheduled_for = None
+            if log_item is not None:
+                log_item.publish_status = PublicationStatus.FAILED
+                log_item.retry_after = None
+                log_item.error_text = message
+
+            reviewed_at = datetime.now(timezone.utc)
+            related = await self.moderation.get_related_submissions(session, submission)
+            for item in related:
+                item.status = SubmissionStatus.HOLD
+                item.reviewed_at = reviewed_at
+                item.moderator_note = message
+
+            await session.commit()
+            return True
+
     async def mark_legacy_delayed_published(
         self,
         *,
@@ -633,6 +761,9 @@ class LegacyModerationSyncService:
             log_item.published_at = None
             log_item.telegram_message_id = None
             log_item.error_text = LEGACY_DELAYED_AUDIT_LOG_MARKER
+            log_item.attempt_count = 0
+            log_item.last_attempt_at = None
+            log_item.retry_after = None
 
         reviewed_at = datetime.now(timezone.utc)
         related = await self.moderation.get_related_submissions(session, submission)

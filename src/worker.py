@@ -1395,6 +1395,93 @@ class SubBot:
         ):
             return False
 
+        delivery_claimed = await self.legacy_moderation_sync.claim_legacy_delayed_delivery(
+            channel_tg_id=self.channel_id,
+            review_chat_id=self.chat_suggest,
+            review_message_id=int(message_id),
+        )
+        if not delivery_claimed:
+            self.delayed_message.pop(message_id, None)
+            logger.info(
+                "Skip delayed message {} for channel {}: delivery already claimed or finalized",
+                message_id,
+                self.channel_username,
+            )
+            try:
+                await self.delayed_database.delete_delayed_posts({
+                    "bot_id": self.bot_info.id,
+                    "message_id": int(message_id),
+                })
+            except Exception as cleanup_ex:
+                logger.warning(
+                    "Failed to remove already-claimed delayed message {}: {}",
+                    message_id,
+                    cleanup_ex,
+                )
+            return False
+
+        # The durable publication-log claim above is the source of truth. Remove
+        # the legacy queue entry before the non-idempotent Telegram call so a
+        # restart cannot reload and resend an ambiguously completed request.
+        self.delayed_message.pop(message_id, None)
+        try:
+            await self.delayed_database.delete_delayed_posts({
+                "bot_id": self.bot_info.id,
+                "message_id": int(message_id),
+            })
+        except Exception as cleanup_ex:
+            logger.warning(
+                "Failed to remove claimed delayed message {} from legacy queue: {}",
+                message_id,
+                cleanup_ex,
+            )
+
+        try:
+            return await self._send_claimed_delayed_message(message_id, sender_id)
+        except asyncio.CancelledError:
+            # asyncio.wait_for cancels the delivery coroutine on its own timeout.
+            # Telegram may already have accepted copyMessage, so cancellation is
+            # an ambiguous result and must never put the item back in the queue.
+            try:
+                await self.legacy_moderation_sync.mark_legacy_delayed_delivery_uncertain(
+                    channel_tg_id=self.channel_id,
+                    review_chat_id=self.chat_suggest,
+                    review_message_id=int(message_id),
+                    error_text="Telegram delivery was cancelled or timed out",
+                )
+            except Exception as state_ex:
+                logger.error(
+                    "Failed to record cancelled delayed delivery for message {}: {}",
+                    message_id,
+                    state_ex,
+                )
+            raise
+        except Exception as ex:
+            try:
+                if is_transient_telegram_error(ex):
+                    await self.legacy_moderation_sync.mark_legacy_delayed_delivery_uncertain(
+                        channel_tg_id=self.channel_id,
+                        review_chat_id=self.chat_suggest,
+                        review_message_id=int(message_id),
+                        error_text=str(ex),
+                    )
+                else:
+                    await self.legacy_moderation_sync.release_legacy_publication_claim(
+                        channel_tg_id=self.channel_id,
+                        review_chat_id=self.chat_suggest,
+                        review_message_id=int(message_id),
+                        error_text=str(ex),
+                    )
+            except Exception as state_ex:
+                logger.error(
+                    "Failed to record delayed delivery failure for message {}: {}",
+                    message_id,
+                    state_ex,
+                )
+            raise
+
+    async def _send_claimed_delayed_message(self, message_id, sender_id) -> bool:
+
         markup = None
         is_anonymous = message_id in self.anonym_send
 
@@ -1494,7 +1581,6 @@ class SubBot:
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
-        self.delayed_message.pop(message_id, None)
         if is_anonymous:
             self.anonym_send.discard(message_id)
         logger.info(f"send delayed message: {message_id}, username_channel: {self.channel_username}")
