@@ -27,6 +27,7 @@ from src.editorial.models.paste import PasteChannelRule, PasteLibrary, PasteUsag
 from src.editorial.models.publication import PublicationLog
 from src.editorial.models.review import Review
 from src.editorial.models.submission import Submission
+from src.editorial.models.suggestion_ad import SuggestionAdCounter, SuggestionAdExclusion, SuggestionAdSettings
 from src.editorial.models.tag import ChannelPasteTagRule, GlobalPasteTagRule, PasteTagAssignment, TagDefinition, TagKeyword
 
 __all__ = [
@@ -65,6 +66,9 @@ __all__ = [
     "Review",
     "ReviewDecision",
     "Submission",
+    "SuggestionAdCounter",
+    "SuggestionAdExclusion",
+    "SuggestionAdSettings",
     "SubmissionStatus",
     "TagAssignmentSource",
     "TagDefinition",

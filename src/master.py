@@ -33,10 +33,13 @@ from src.editorial.services.statistics_export import (
     validate_statistics_delta_days,
 )
 from src.editorial.services.telegram_actions import TelegramEditorialActions
+from src.editorial.services.suggestion_ad_service import suggestion_ad_html
 from src.confession_publisher import ConfessionPublisherRuntime
 from src.telegram_runtime import calculate_telegram_request_limit
 from src.panel_markups import (
     build_ad_link_exclusions_panel,
+    build_suggestion_ads_panel,
+    build_suggestion_ad_exclusions_panel,
     build_admin_menu,
     build_channel_actions,
     build_channel_history_import_progress_actions,
@@ -374,6 +377,95 @@ class MasterBot:
             ),
             reply_markup=build_extra_panel(is_general_admin=is_general_admin),
         )
+
+    async def _show_suggestion_ads_panel(self, chat_id: int) -> None:
+        self._clear_user_state(chat_id)
+        text_html = await self.editorial_actions.get_suggestion_ad_text()
+        text = (
+            "Настройка рекламы предложек.\n\n"
+            "Общий текст для подслушек и признавашек. Реклама отправляется после "
+            "1-го сообщения человека, затем после 6-го, 11-го и далее через каждые 5. "
+            "Счётчик отдельный для каждого человека в каждом паблике. "
+            "Альбом считается одним обращением.\n\n"
+            "Текущий текст (HTML):\n"
+            + (text_html or "Текст пока не задан — реклама не отправляется.")
+        )
+        await self._send_suggestion_ad_panel_text(chat_id, text, build_suggestion_ads_panel())
+
+    async def _show_suggestion_ad_exclusions_panel(self, chat_id: int) -> None:
+        self._clear_user_state(chat_id)
+        tags = await self.editorial_actions.list_suggestion_ad_exclusions()
+        text = (
+            "Исключения для рекламы в предложках.\n"
+            "В этих пабликах подслушек и признавашек реклама после сообщений не отправляется.\n\n"
+            + ("\n".join(f"{index}. @{tag}" for index, tag in enumerate(tags, start=1))
+               if tags else "Список пока пуст.")
+        )
+        await self._send_suggestion_ad_panel_text(chat_id, text, build_suggestion_ad_exclusions_panel())
+
+    async def _send_suggestion_ad_panel_text(self, chat_id: int, text: str, markup) -> None:
+        chunks = [text[index:index + 3900] for index in range(0, len(text), 3900)]
+        for chunk in chunks[:-1]:
+            await self.main_bot.send_message(chat_id=chat_id, text=chunk)
+        await self.main_bot.send_message(chat_id=chat_id, text=chunks[-1], reply_markup=markup)
+
+    async def _handle_suggestion_ad_callback(self, action: str, chat_id: int) -> None:
+        if action == "suggestion_ads":
+            await self._show_suggestion_ads_panel(chat_id)
+        elif action == "suggestion_ad_exclusions":
+            await self._show_suggestion_ad_exclusions_panel(chat_id)
+        elif action == "suggestion_ad_text":
+            self._set_user_state(chat_id, "await_suggestion_ad_text")
+            await self.main_bot.send_message(
+                chat_id,
+                'Отправьте рекламный текст одним сообщением. Можно использовать HTML, '
+                'например <b>Текст</b> и <tg-emoji emoji-id="123456789">👍</tg-emoji>, '
+                'или прислать готовое сообщение с форматированием и кастомными эмодзи. '
+                'Перед сохранением бот покажет предпросмотр.',
+                reply_markup=build_suggestion_ads_panel(),
+            )
+        else:
+            is_add = action == "add_suggestion_ad_exclusion"
+            self._set_user_state(
+                chat_id,
+                "await_add_suggestion_ad_exclusion" if is_add else "await_delete_suggestion_ad_exclusion",
+            )
+            await self.main_bot.send_message(
+                chat_id,
+                "Введите тег паблика, например @channel_name, "
+                + ("чтобы добавить его в исключения." if is_add else "чтобы удалить его из исключённых."),
+                reply_markup=build_suggestion_ad_exclusions_panel(),
+            )
+
+    async def _handle_suggestion_ad_text(self, message: Message, action: str, text_value: str) -> bool:
+        try:
+            if action == "await_suggestion_ad_text":
+                text_html = suggestion_ad_html(message)
+                # Let Telegram validate HTML/length before replacing the saved advertisement.
+                await self.main_bot.send_message(
+                    chat_id=message.chat.id,
+                    text=text_html,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                await self.editorial_actions.set_suggestion_ad_text(text_html=text_html)
+                await self.main_bot.send_message(message.chat.id, "Рекламный текст сохранён.")
+                await self._show_suggestion_ads_panel(message.chat.id)
+            elif action == "await_add_suggestion_ad_exclusion":
+                tag, created = await self.editorial_actions.add_suggestion_ad_exclusion(channel_tag=text_value)
+                await self.main_bot.send_message(
+                    message.chat.id,
+                    f"@{tag} добавлен в исключения." if created else f"@{tag} уже есть в исключениях.",
+                )
+                await self._show_suggestion_ad_exclusions_panel(message.chat.id)
+            else:
+                tag = await self.editorial_actions.delete_suggestion_ad_exclusion(channel_tag=text_value)
+                await self.main_bot.send_message(message.chat.id, f"@{tag} удалён из исключённых.")
+                await self._show_suggestion_ad_exclusions_panel(message.chat.id)
+        except (ValueError, asyncio_helper.ApiTelegramException) as exc:
+            self._set_user_state(message.chat.id, action)
+            await self.main_bot.send_message(message.chat.id, f"Не удалось сохранить настройку: {exc}\nОтправьте сообщение ещё раз.")
+        return True
 
     async def _show_ad_link_exclusions_panel(self, chat_id: int) -> None:
         exclusions = await self.editorial_actions.list_ad_link_exclusions()
@@ -2524,6 +2616,13 @@ class MasterBot:
             self._clear_user_state(message.chat.id)
         text_value = (message.text or message.caption or "").strip()
 
+        if action in {
+            "await_suggestion_ad_text",
+            "await_add_suggestion_ad_exclusion",
+            "await_delete_suggestion_ad_exclusion",
+        }:
+            return await self._handle_suggestion_ad_text(message, action, text_value)
+
         if action == "await_confession_publisher_token":
             if not self._is_general_admin(message.from_user.id if message.from_user else message.chat.id):
                 await self.main_bot.send_message(message.chat.id, "Только для генерального администратора.")
@@ -3653,6 +3752,10 @@ class MasterBot:
                             f"Отложено до восстановления Telegram: {result.deferred}\n"
                             f"Ошибок: {result.failed}",
                         )
+                    case "suggestion_ads" | "suggestion_ad_text" | "suggestion_ad_exclusions" | "add_suggestion_ad_exclusion" | "delete_suggestion_ad_exclusion":
+                        await self._safe_answer_callback(self.main_bot, call.id)
+                        answered_early = True
+                        await self._handle_suggestion_ad_callback(action, call.message.chat.id)
                     case "ad_link_exclusions":
                         await self._safe_answer_callback(self.main_bot, call.id)
                         answered_early = True

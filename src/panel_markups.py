@@ -58,7 +58,28 @@ def build_extra_panel(is_general_admin: bool = False) -> InlineKeyboardMarkup:
             )
         )
     markup.add(InlineKeyboardButton("SQL -> CSV", callback_data="panel:sql_export"))
+    markup.add(InlineKeyboardButton("Настройка рекламы предложек", callback_data="panel:suggestion_ads"))
     markup.add(InlineKeyboardButton("\u041d\u0430\u0437\u0430\u0434 \u0432 \u043f\u0430\u043d\u0435\u043b\u044c", callback_data="panel:main"))
+    return markup
+
+
+def build_suggestion_ads_panel() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("Установить текст рекламы", callback_data="panel:suggestion_ad_text"),
+        InlineKeyboardButton("Настройка исключений", callback_data="panel:suggestion_ad_exclusions"),
+        InlineKeyboardButton("Назад", callback_data="panel:extra"),
+    )
+    return markup
+
+
+def build_suggestion_ad_exclusions_panel() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("Добавить паблик в исключения", callback_data="panel:add_suggestion_ad_exclusion"),
+        InlineKeyboardButton("Удалить из исключённых", callback_data="panel:delete_suggestion_ad_exclusion"),
+        InlineKeyboardButton("Назад", callback_data="panel:suggestion_ads"),
+    )
     return markup
 
 

@@ -39,6 +39,7 @@ async def test_legacy_review_sends_one_control_card_for_the_whole_album() -> Non
     subbot.bot_info = SimpleNamespace(username="suggest_bot")
     subbot.callback_new_submission = AsyncMock()
     subbot._save_incoming_message = AsyncMock()
+    subbot._send_suggestion_ad = AsyncMock()
 
     messages = [_message(12), _message(11, caption="Album caption")]
     await subbot._send_media_group_to_legacy_chat(messages)
@@ -56,6 +57,7 @@ async def test_legacy_review_sends_one_control_card_for_the_whole_album() -> Non
         ((messages[1], control_message), {}),
         ((messages[0], control_message), {}),
     ]
+    subbot._send_suggestion_ad.assert_awaited_once_with(messages[1])
     subbot.callback_new_submission.assert_awaited_once_with(
         channel_tg_id=-10077,
         review_chat_id=-10055,

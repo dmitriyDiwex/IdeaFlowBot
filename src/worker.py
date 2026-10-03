@@ -25,6 +25,7 @@ from src.editorial.services.publication_signature import (
     should_add_publication_signature,
 )
 from src.editorial.services.telegram_resilience import is_transient_telegram_error
+from src.editorial.services.suggestion_ad_service import SuggestionAdService
 from src.legacy_delayed import delayed_publication_matches
 from src.legacy_media_groups import (
     LegacyMediaGroupReference,
@@ -83,6 +84,7 @@ class SubBot:
         self.legacy_moderation_sync = LegacyModerationSyncService()
         self.publication_guard = LegacyPublicationGuard()
         self.ad_link_exclusion_service = AdLinkExclusionService()
+        self.suggestion_ad_service = SuggestionAdService()
 
         self.token = api_token_bot
         self.channel_username = channel_username
@@ -425,9 +427,7 @@ class SubBot:
                 await self._queue_media_group(message)
                 return
 
-            review_message = await self._send_review_message_to_legacy_chat(message)
-            await self._save_incoming_message(message, review_message)
-            await self._notify_new_submission(review_message)
+            await self._process_single_submission(message)
 
         async def shift_timer():
             interval_lst = list(map(
@@ -1045,6 +1045,33 @@ class SubBot:
             review_message_id=getattr(review_message, "message_id", None),
         )
 
+    async def _process_single_submission(self, message: Message) -> None:
+        review_message = await self._send_review_message_to_legacy_chat(message)
+        await self._save_incoming_message(message, review_message)
+        await self._notify_new_submission(review_message)
+        if review_message is not None:
+            await self._send_suggestion_ad(message)
+
+    async def _send_suggestion_ad(self, message: Message) -> None:
+        try:
+            async with session_factory() as session:
+                text_html = await self.suggestion_ad_service.record_submission(
+                    session,
+                    channel_tg_id=self.channel_id,
+                    channel_tag=self.channel_username,
+                    user_id=message.chat.id,
+                )
+            if text_html:
+                await self.sup_bot.send_message(
+                    chat_id=message.chat.id,
+                    text=text_html,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+        except Exception as exc:
+            # An advertisement must never interrupt collection or moderation.
+            logger.warning("Failed to send suggestion ad for channel {}: {}", self.channel_id, exc)
+
     async def _notify_new_submission(self, review_message) -> None:
         if self.callback_new_submission is None or review_message is None:
             return
@@ -1142,6 +1169,7 @@ class SubBot:
             await self._save_incoming_message(message, control_message)
 
         await self._notify_new_submission(control_message)
+        await self._send_suggestion_ad(messages[0])
 
     async def _copy_media_group_to_current_legacy_chat(self, messages: list[Message]):
         return await self.sup_bot.copy_messages(

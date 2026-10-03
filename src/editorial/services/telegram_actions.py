@@ -52,6 +52,7 @@ from src.editorial.services.scheduler import SchedulerService
 from src.editorial.services.statistics_export import StatisticsExportService
 from src.editorial.services.tag_service import PasteTagSummary, TagService
 from src.editorial.services.telegram_resilience import is_transient_telegram_error
+from src.editorial.services.suggestion_ad_service import SuggestionAdService
 from src.editorial.utils.text import clean_text, compute_raw_text_hash, compute_text_hash, normalize_text
 
 
@@ -132,6 +133,7 @@ class TelegramEditorialActions:
         self.auto_slot_planner = AutoSlotPlannerService()
         self.channel_profile_service = ChannelProfileService(legacy_reader=self.legacy_reader)
         self.ad_link_exclusion_service = AdLinkExclusionService()
+        self.suggestion_ad_service = SuggestionAdService()
         self.tag_service = TagService()
         self.scheduler = SchedulerService()
         self.publisher = PublisherService()
@@ -481,6 +483,26 @@ class TelegramEditorialActions:
                 start_time=start_time,
                 end_time=end_time,
             )
+
+    async def get_suggestion_ad_text(self) -> str | None:
+        async with session_factory() as session:
+            return await self.suggestion_ad_service.get_text(session)
+
+    async def set_suggestion_ad_text(self, *, text_html: str) -> None:
+        async with session_factory() as session:
+            await self.suggestion_ad_service.set_text(session, text_html=text_html)
+
+    async def list_suggestion_ad_exclusions(self) -> list[str]:
+        async with session_factory() as session:
+            return await self.suggestion_ad_service.list_exclusions(session)
+
+    async def add_suggestion_ad_exclusion(self, *, channel_tag: str) -> tuple[str, bool]:
+        async with session_factory() as session:
+            return await self.suggestion_ad_service.add_exclusion(session, channel_tag=channel_tag)
+
+    async def delete_suggestion_ad_exclusion(self, *, channel_tag: str) -> str:
+        async with session_factory() as session:
+            return await self.suggestion_ad_service.delete_exclusion(session, channel_tag=channel_tag)
 
     async def list_ad_link_exclusions(self):
         async with session_factory() as session:
