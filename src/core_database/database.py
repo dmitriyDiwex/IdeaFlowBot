@@ -3,6 +3,7 @@ import sqlite3
 
 from loguru import logger
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import insert, select, and_, delete, update, Delete, func
 
 from src.core_database.models.base import Base
@@ -332,9 +333,17 @@ class CrudUserData:
     @staticmethod
     async def insert_user(data: dict) -> None:
         async with db_helper.engine.connect() as conn:
-            stmt = (
-                insert(UserData).values(data)
-            )
+            dialect_insert = {
+                "postgresql": pg_insert,
+                "sqlite": sqlite_insert,
+            }.get(conn.dialect.name, insert)
+            stmt = dialect_insert(UserData).values(data)
+            if conn.dialect.name in {"postgresql", "sqlite"}:
+                # Concurrent handlers or a stale cache may register the same pair.
+                # Ignore only that unique key; other integrity errors must surface.
+                stmt = stmt.on_conflict_do_nothing(
+                    index_elements=[UserData.user_id, UserData.bot_username],
+                )
             await conn.execute(stmt)
             await conn.commit()
 

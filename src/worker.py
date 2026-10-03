@@ -220,8 +220,13 @@ class SubBot:
                         }
                     )
                     self.users_data.add(message.chat.id)
-            except IntegrityError:
-                logger.error("IntegrityError")
+            except IntegrityError as exc:
+                logger.error(
+                    "User registration IntegrityError: bot={}, user_id={}, error={}",
+                    self.bot_info.username,
+                    message.chat.id,
+                    exc.orig,
+                )
 
         @logger.catch
         @self.sup_bot.message_handler(commands=['start'])
