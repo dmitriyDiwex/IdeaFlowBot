@@ -1,0 +1,118 @@
+{
+  "version": "1",
+  "policy_version": "1.0.0-draft",
+  "provenance": "Derived from the user-supplied playbook; synthetic fixtures, not independent human labels",
+  "evaluation_date": "2026-10-03",
+  "cases": [
+    {
+      "id": "student_question",
+      "text": "Кто знает, когда начнётся заселение?",
+      "decision": "approve",
+      "reason_code": "ok",
+      "playbook_section": "5.1"
+    },
+    {
+      "id": "rude_joke",
+      "text": "Сессия опять сожрала мой мозг, универ — цирк",
+      "decision": "approve",
+      "reason_code": "ok",
+      "playbook_section": "5.3"
+    },
+    {
+      "id": "hate",
+      "text": "[Синтетический призыв к насилию по национальному признаку]",
+      "decision": "reject",
+      "reason_code": "hate_or_incite",
+      "playbook_section": "6.1"
+    },
+    {
+      "id": "survey",
+      "text": "Помогите заполнить анкету для исследования",
+      "decision": "reject",
+      "reason_code": "survey",
+      "playbook_section": "6.2"
+    },
+    {
+      "id": "meaningless",
+      "text": "Макарошки, яблоко, чеснок",
+      "decision": "reject",
+      "reason_code": "meaningless",
+      "playbook_section": "6.3"
+    },
+    {
+      "id": "admin_only",
+      "text": "Админ! Комменты вообще видят?",
+      "decision": "reject",
+      "reason_code": "admin_only",
+      "playbook_section": "6.4"
+    },
+    {
+      "id": "admin_intro",
+      "text": "Админ, опубликуй, пожалуйста. Кто знает, когда начнётся заселение?",
+      "decision": "approve",
+      "reason_code": "ok",
+      "playbook_section": "6.4"
+    },
+    {
+      "id": "advertising_request",
+      "text": "Как можно договориться о рекламе?",
+      "decision": "advertising",
+      "reason_code": "advertising",
+      "playbook_section": "7.1"
+    },
+    {
+      "id": "unknown_group",
+      "text": "Подписывайтесь на нашу неизвестную Telegram-группу",
+      "decision": "reject",
+      "reason_code": "native_promo",
+      "playbook_section": "6.5"
+    },
+    {
+      "id": "small_private_service",
+      "text": "Предлагаю недорого проколоть септум, нужен один человек для записи",
+      "decision": "approve",
+      "reason_code": "ok",
+      "playbook_section": "5.4"
+    },
+    {
+      "id": "past_event",
+      "text": "Продам билет на концерт 2020-01-01",
+      "decision": "reject",
+      "reason_code": "outdated",
+      "playbook_section": "6.6"
+    },
+    {
+      "id": "exact_duplicate",
+      "text": "Кто знает, когда начнётся заселение?",
+      "decision": "reject",
+      "reason_code": "duplicate",
+      "playbook_section": "6.7",
+      "context": {
+        "earlier_original": "student_question",
+        "same_queue": true
+      }
+    },
+    {
+      "id": "normalized_duplicate",
+      "text": "Кто знает, когда начнётся заселение!!!",
+      "decision": "reject",
+      "reason_code": "duplicate",
+      "playbook_section": "6.7",
+      "context": {
+        "earlier_original": "student_question",
+        "same_queue": true
+      }
+    },
+    {
+      "id": "media",
+      "text": "[Фото без доступного содержимого]",
+      "decision": "hold",
+      "reason_code": "media_review",
+      "playbook_section": "8",
+      "context": {
+        "media": "include",
+        "content_unavailable": true
+      }
+    }
+  ]
+}

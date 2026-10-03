@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
+import math
+import asyncio
+from collections import defaultdict
 import re
 from typing import Literal
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, case, cast, func, or_, select, String
+from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -15,7 +20,8 @@ from src.editorial.models.channel import Channel
 from src.editorial.models.content import ContentItem
 from src.editorial.models.enums import ContentItemStatus, ReviewDecision, SubmissionStatus
 from src.editorial.models.mcp_moderation import McpModerationAction
-from src.editorial.models.moderation_case import ModerationCase
+from src.editorial.models.moderation_case import ModerationCase, ModerationCaseEvent
+from src.editorial.services.moderation_playbook import playbook
 from src.editorial.models.submission import Submission
 from src.editorial.services.legacy_audit import LEGACY_DELAYED_AUDIT_TEMPLATE_KEY
 from src.editorial.services.moderation import ModerationService
@@ -29,6 +35,9 @@ MCP_HOLD = "hold"
 MCP_ADVERTISING = "advertising"
 McpDecision = Literal["approve", "reject", "hold", "advertising"]
 PENDING_STATUSES = {SubmissionStatus.NEW, SubmissionStatus.HOLD}
+# SQLite is a local test backend; PostgreSQL channel row locks coordinate workers.
+_LOCAL_CHANNEL_LOCKS = defaultdict(asyncio.Lock)
+
 BATCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$")
 
 
@@ -51,8 +60,12 @@ class McpModerationService:
         actor_id: int | None = None,
         max_batch_size: int | None = None,
         max_list_size: int | None = None,
+        clock=None,
+        policy=playbook,
     ) -> None:
         self.session_maker = session_maker
+        self.clock = clock
+        self.policy = policy
         self.write_enabled = settings.mcp_write_enabled if write_enabled is None else write_enabled
         self.actor_id = settings.mcp_actor_id if actor_id is None else actor_id
         self.max_batch_size = max_batch_size or settings.mcp_max_batch_size
@@ -103,6 +116,7 @@ class McpModerationService:
                 }
             )
         return {
+            **self.policy.response_metadata(),
             "access_scope": "all_proposal_queues",
             "channel_allowlist_enabled": False,
             "count": len(rows),
@@ -149,6 +163,7 @@ class McpModerationService:
                 channels = {item.id: item for item in channel_rows}
 
         return {
+            **self.policy.response_metadata(),
             "access_scope": "all_proposal_queues",
             "channel_id": channel_id,
             "include_hold": include_hold,
@@ -179,6 +194,7 @@ class McpModerationService:
         content_types = sorted({item.content_type for item in related})
         requires_media_review = any(value != "text" for value in content_types)
         return {
+            **self.policy.response_metadata(),
             "submission_id": min(item.id for item in related),
             "requested_submission_id": submission_id,
             "related_submission_ids": [item.id for item in related],
@@ -241,6 +257,7 @@ class McpModerationService:
                 channels = {item.id: item for item in channel_rows}
 
         return {
+            **self.policy.response_metadata(),
             "count": len(cases),
             "examples": [
                 {
@@ -287,6 +304,7 @@ class McpModerationService:
             outcome = str(result["outcome"])
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
         return {
+            **self.policy.response_metadata(),
             "batch_id": batch_id,
             "dry_run": dry_run,
             "write_enabled": self.write_enabled,
@@ -331,6 +349,7 @@ class McpModerationService:
             )
             results.append(payload)
         return {
+            **self.policy.response_metadata(),
             "batch_id": batch_id,
             "found": bool(operations),
             "count": len(results),
@@ -338,12 +357,35 @@ class McpModerationService:
         }
 
     async def _apply_one(
+        self, *, request_id: str, batch_id: str, action: ModerationRequest,
+        dry_run: bool, expected_members: list[dict] | None = None,
+    ) -> dict[str, object]:
+        # SQLite does not implement FOR UPDATE. Tests serialize only this local backend.
+        async with self.session_maker() as session:
+            dialect = session.bind.dialect.name
+            engine_key = id(session.bind)
+            if dialect == "sqlite":
+                submission = await session.get(Submission, action.submission_id)
+                channel_id = submission.channel_id if submission is not None else 0
+        if dialect == "sqlite":
+            async with _LOCAL_CHANNEL_LOCKS[(engine_key, channel_id)]:
+                return await self._apply_one_locked(
+                    request_id=request_id, batch_id=batch_id, action=action,
+                    dry_run=dry_run, expected_members=expected_members,
+                )
+        return await self._apply_one_locked(
+            request_id=request_id, batch_id=batch_id, action=action,
+            dry_run=dry_run, expected_members=expected_members,
+        )
+
+    async def _apply_one_locked(
         self,
         *,
         request_id: str,
         batch_id: str,
         action: ModerationRequest,
         dry_run: bool,
+        expected_members: list[dict] | None = None,
     ) -> dict[str, object]:
         async with self.session_maker() as session:
             existing = await session.scalar(
@@ -352,6 +394,8 @@ class McpModerationService:
             if existing is not None:
                 if not self._operation_matches(existing, action, dry_run):
                     return self._request_conflict_payload(existing, action)
+                if existing.outcome == "applied" and existing.telegram_sync_state == "pending":
+                    return await self._sync_legacy_panel(existing.id, existing.decision)
                 return self._operation_payload(existing, replayed=True)
 
             previous_status: str | None = None
@@ -363,7 +407,6 @@ class McpModerationService:
                         Submission.id == action.submission_id,
                         self._visible_submission_filter(),
                     )
-                    .with_for_update()
                 )
                 if submission is None:
                     operation = self._new_operation(
@@ -378,8 +421,21 @@ class McpModerationService:
                     await session.commit()
                     return self._operation_payload(operation)
 
-                related = await self.moderation.get_related_submissions(session, submission)
-                channel = await session.get(Channel, submission.channel_id)
+                channel = await session.scalar(
+                    select(Channel).where(Channel.id == submission.channel_id).with_for_update()
+                )
+                related = await self.moderation.get_related_submissions(session, submission, lock=True)
+                if not related:
+                    raise ValueError("Submission disappeared while acquiring locks")
+                submission = next(item for item in related if item.id == action.submission_id)
+                # Another worker may have committed this request while we waited.
+                existing = await session.scalar(
+                    select(McpModerationAction).where(McpModerationAction.request_id == request_id)
+                )
+                if existing is not None:
+                    if not self._operation_matches(existing, action, dry_run):
+                        return self._request_conflict_payload(existing, action)
+                    return self._operation_payload(existing, replayed=True)
                 canonical_submission = min(related, key=lambda item: item.id)
                 channel_id = submission.channel_id
                 current_statuses = {self._status_value(item.status) for item in related}
@@ -398,10 +454,16 @@ class McpModerationService:
                 await session.flush()
 
                 expected = self._status_value(action.expected_status)
-                if current_statuses != {expected}:
+                protected = await self._human_decided(session, related)
+                revision_changed = expected_members is not None and (
+                    [self._member_revision(item) for item in sorted(related, key=lambda item: item.id)]
+                    != expected_members
+                )
+                if protected or revision_changed or current_statuses != {expected}:
                     operation.outcome = "skipped"
                     operation.resulting_status = previous_status
                     operation.error_text = (
+                        "Human decision or snapshot revision conflict" if protected or revision_changed else
                         f"Status precondition failed: expected {expected}, "
                         f"actual {', '.join(sorted(current_statuses))}"
                     )
@@ -433,6 +495,13 @@ class McpModerationService:
                     await session.commit()
                     return self._operation_payload(operation)
 
+                retry_after = await self._rate_retry_after(session, channel_id)
+                if retry_after:
+                    await session.rollback()
+                    return {"outcome": "deferred", "submission_id": action.submission_id,
+                            "retry_after_seconds": retry_after}
+                operation.rate_limit_at = await self._now(session)
+                operation.created_at = operation.rate_limit_at
                 content_item_id = await self._apply_decision(
                     session=session,
                     submission=submission,
@@ -442,6 +511,9 @@ class McpModerationService:
                 operation.outcome = "applied"
                 operation.resulting_status = target_status.value
                 operation.content_item_id = content_item_id
+                operation.telegram_sync_state = (
+                    "pending" if action.decision != MCP_HOLD else "not_required"
+                )
                 operation.completed_at = datetime.now(timezone.utc)
                 await session.commit()
             except Exception as exc:
@@ -564,29 +636,131 @@ class McpModerationService:
         return None
 
     async def _sync_legacy_panel(self, operation_id: int, decision: str) -> dict[str, object]:
+        # Claim before any external send. A crash after dispatch is visible and never
+        # blindly resends an advertising response.
+        async with self.session_maker() as session:
+            operation = await session.scalar(
+                select(McpModerationAction).where(McpModerationAction.id == operation_id).with_for_update()
+            )
+            if operation is None:
+                raise ValueError(f"MCP operation {operation_id} not found")
+            if operation.telegram_sync_state != "pending":
+                return self._operation_payload(operation, replayed=True)
+            operation.telegram_sync_state = "dispatching"
+            await session.commit()
+            submission_id = operation.submission_id
         warning = None
         sync_count = 0
         try:
             from src.editorial.services.telegram_actions import TelegramEditorialActions
 
-            actions = TelegramEditorialActions()
             async with self.session_maker() as session:
-                operation = await session.get(McpModerationAction, operation_id)
-                if operation is None or operation.submission_id is None:
-                    raise ValueError(f"MCP operation {operation_id} not found")
-                submission_id = operation.submission_id
-            sync_count = await self._apply_telegram_side_effects(actions, submission_id, decision)
+                submission = await session.get(Submission, submission_id)
+                if submission is None:
+                    raise ValueError("Submission missing before Telegram synchronization")
+                related = await self.moderation.get_related_submissions(session, submission)
+                if (any(self._status_value(item.status) != operation.resulting_status for item in related)
+                        or await self._human_decided(session, related)):
+                    raise ValueError("Human decision or status change before Telegram synchronization")
+            actions = TelegramEditorialActions()
+            if decision == MCP_ADVERTISING:
+                await actions.send_submission_advertising_reply_v2(submission_id, strict=True)
+            sync_count = await actions.legacy_moderation_sync.sync_panel_submission_agent_checked(
+                submission_id, decision=decision,
+            )
         except Exception as exc:
             warning = f"Moderation was applied, but Telegram synchronization failed: {exc}"
 
         async with self.session_maker() as session:
             operation = await session.get(McpModerationAction, operation_id)
-            if operation is None:
-                raise ValueError(f"MCP operation {operation_id} not found")
             operation.legacy_sync_count = sync_count
-            operation.warning_text = warning
+            operation.warning_text = self._truncate(warning, 4000) if warning else None
+            operation.telegram_sync_state = "warning" if warning else "verified"
+            # Conservative sliding window includes the completion of Telegram work.
+            operation.rate_limit_at = await self._now(session)
             await session.commit()
             return self._operation_payload(operation)
+
+    async def _now(self, session) -> datetime:
+        if self.clock is not None:
+            return self.clock()
+        if session.bind.dialect.name == "postgresql":
+            return await session.scalar(select(func.clock_timestamp()))
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _utc(value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+    @classmethod
+    def _member_revision(cls, item: Submission) -> dict:
+        return {
+            "id": item.id, "status": cls._status_value(item.status),
+            "reviewed_at": cls._utc(item.reviewed_at).isoformat() if item.reviewed_at else None,
+            "note": item.moderator_note,
+            "text_sha256": hashlib.sha256((item.cleaned_text or item.raw_text or "").encode()).hexdigest(),
+            "content_type": item.content_type, "media_group_id": item.media_group_id,
+            "channel_id": item.channel_id, "source_chat_id": item.source_chat_id,
+        }
+
+    @staticmethod
+    def _human_history_filter():
+        # Events retain human provenance even after cancellation or a later MCP case.
+        return or_(
+            select(ModerationCase.id).where(
+                ModerationCase.canonical_submission_id == Submission.id,
+                ModerationCase.source != MCP_MODERATION_SOURCE,
+            ).exists(),
+            select(ModerationCaseEvent.id).join(
+                ModerationCase, ModerationCase.id == ModerationCaseEvent.case_id,
+            ).where(
+                ModerationCase.canonical_submission_id == Submission.id,
+                ModerationCaseEvent.source != MCP_MODERATION_SOURCE,
+            ).exists(),
+        )
+
+    @staticmethod
+    def _human_review_filter():
+        peer = aliased(Submission)
+        canonical_id = case(
+            (Submission.media_group_id.is_not(None),
+             select(func.min(peer.id)).where(
+                 peer.channel_id == Submission.channel_id,
+                 peer.source_chat_id.is_not_distinct_from(Submission.source_chat_id),
+                 peer.media_group_id == Submission.media_group_id,
+             ).correlate(Submission).scalar_subquery()),
+            else_=Submission.id,
+        )
+        proven_mcp_review = select(McpModerationAction.id).where(
+            McpModerationAction.submission_id == canonical_id,
+            McpModerationAction.outcome == "applied",
+            McpModerationAction.dry_run.is_(False),
+            McpModerationAction.resulting_status == cast(Submission.status, String),
+            ("Codex MCP: " + McpModerationAction.reason) == Submission.moderator_note,
+            McpModerationAction.completed_at >= Submission.reviewed_at,
+        ).exists()
+        return and_(Submission.reviewed_at.is_not(None), ~proven_mcp_review)
+
+    async def _human_decided(self, session, related: list[Submission]) -> bool:
+        # A note prefix is not provenance: humans may hold/reopen while retaining it.
+        return bool(await session.scalar(select(Submission.id).where(
+            Submission.id.in_([item.id for item in related]),
+            or_(self._human_history_filter(), self._human_review_filter()),
+        ).limit(1)))
+
+    async def _rate_retry_after(self, session, channel_id: int) -> int:
+        now = await self._now(session)
+        times = list((await session.execute(select(McpModerationAction.rate_limit_at).where(
+            McpModerationAction.channel_id == channel_id,
+            McpModerationAction.dry_run.is_(False),
+            McpModerationAction.outcome == "applied",
+            or_(McpModerationAction.rate_limit_at > now - timedelta(seconds=60),
+                McpModerationAction.telegram_sync_state.in_(["pending", "dispatching"])),
+        ).order_by(McpModerationAction.rate_limit_at))).scalars())
+        if len(times) < 20:
+            return 0
+        # Unknown in-flight external effects conservatively occupy capacity.
+        return max(1, math.ceil((self._utc(times[-20]) + timedelta(seconds=60) - now).total_seconds()))
 
     @staticmethod
     async def _apply_telegram_side_effects(actions, submission_id: int, decision: str) -> int:
@@ -667,6 +841,7 @@ class McpModerationService:
             warning_text=None,
             error_text=error_text,
             created_at=now,
+            telegram_sync_state="not_required",
             completed_at=now if outcome != "processing" else None,
         )
 
@@ -790,6 +965,7 @@ class McpModerationService:
             "outcome": operation.outcome,
             "content_item_id": operation.content_item_id,
             "legacy_sync_count": operation.legacy_sync_count,
+            "telegram_sync_state": operation.telegram_sync_state,
             "warning": operation.warning_text,
             "error": operation.error_text,
             "created_at": operation.created_at.isoformat(),

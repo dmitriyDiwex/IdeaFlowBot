@@ -21,7 +21,7 @@ from src.editorial.models.enums import (
 from src.editorial.models.generation import GenerationRun
 from src.editorial.models.moderation_subscription import ModerationChannelSubscription
 from src.editorial.models.moderation_case import ModerationCase, ModerationCaseEvent
-from src.editorial.models.mcp_moderation import McpModerationAction
+from src.editorial.models.mcp_moderation import McpModerationAction, McpModerationSnapshot
 from src.editorial.models.notification import NotificationSubscription
 from src.editorial.models.paste import PasteChannelRule, PasteLibrary, PasteUsage
 from src.editorial.models.publication import PublicationLog
@@ -54,6 +54,7 @@ __all__ = [
     "ModerationCase",
     "ModerationCaseEvent",
     "McpModerationAction",
+    "McpModerationSnapshot",
     "NotificationSubscription",
     "PasteChannelRule",
     "PasteLibrary",

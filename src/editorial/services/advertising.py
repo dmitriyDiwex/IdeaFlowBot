@@ -103,6 +103,7 @@ async def send_advertising_flow(
     source_text: str | None,
     sender_username: str | None,
     sender_first_name: str | None,
+    strict: bool = False,
 ) -> None:
     await bot.send_message(chat_id=recipient_user_id, text=build_advertising_reply_text())
 
@@ -116,12 +117,20 @@ async def send_advertising_flow(
 
     alert_bot = _build_advertising_alert_bot() or bot
 
-    for target in resolve_advertising_targets():
-        try:
-            await alert_bot.send_message(
-                chat_id=target,
-                text=advertiser_message,
-                parse_mode="HTML",
-            )
-        except Exception as ex:
-            logger.error("Failed to send advertising alert to {}: {}", target, ex)
+    errors = []
+    try:
+        for target in resolve_advertising_targets():
+            try:
+                await alert_bot.send_message(
+                    chat_id=target,
+                    text=advertiser_message,
+                    parse_mode="HTML",
+                )
+            except Exception as ex:
+                logger.error("Failed to send advertising alert to {}: {}", target, ex)
+                errors.append(str(ex))
+    finally:
+        if strict and alert_bot is not bot:
+            await alert_bot.close_session()
+    if strict and errors:
+        raise ValueError("Advertising reply sent, but manager notification failed: " + "; ".join(errors))

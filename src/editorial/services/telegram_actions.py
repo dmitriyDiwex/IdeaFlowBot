@@ -859,7 +859,7 @@ class TelegramEditorialActions:
             "По рекламе напишите пожалуйста @ivanblk, сразу укажите, что вы хотите рекламировать",
         )
 
-    async def send_submission_advertising_reply_v2(self, submission_id: int) -> None:
+    async def send_submission_advertising_reply_v2(self, submission_id: int, *, strict: bool = False) -> None:
         async with session_factory() as session:
             submission = await session.get(Submission, submission_id)
             if submission is None:
@@ -886,14 +886,19 @@ class TelegramEditorialActions:
         except Exception:
             pass
 
-        await send_advertising_flow(
-            bot=bot,
-            recipient_user_id=int(submission.source_user_id),
-            channel_label=channel_label,
-            source_text=submission.raw_text or submission.cleaned_text,
-            sender_username=submission.username,
-            sender_first_name=submission.first_name,
-        )
+        try:
+            await send_advertising_flow(
+                bot=bot,
+                recipient_user_id=int(submission.source_user_id),
+                channel_label=channel_label,
+                source_text=submission.raw_text or submission.cleaned_text,
+                sender_username=submission.username,
+                sender_first_name=submission.first_name,
+                **({"strict": True} if strict else {}),
+            )
+        finally:
+            if strict:
+                await bot.close_session()
 
     async def ban_submission_author(
         self,

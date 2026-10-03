@@ -18,6 +18,14 @@ def _get_int(name: str, default: int) -> int:
     return int(raw)
 
 
+DEFAULT_MCP_EXCLUDED_BOTS = (
+    "misisforever_bot,lovespolispb_bot,ranhigs_slushaet_bot,urfu_overhear_bot,"
+    "spbgmtuu_bot,predloshka_moscow_poli_bot,guap_never_sleep_bot,rudn_slushaetbot,"
+    "gorni_anon_bot,kfu_ovehear_bot,predloshka_mpei_bot,mephi_podsl_bot,lobach_unn_bot,"
+    "kosygin_bot,spbgti_predloga_bot,igmuni_bot,shtiglewiggle_bot,kubguniver_bot,mgtusluhi_bot"
+)
+
+
 @dataclass(slots=True)
 class EditorialSettings:
     postgres_dsn: str = os.getenv(
@@ -36,6 +44,13 @@ class EditorialSettings:
     mcp_max_batch_size: int = max(1, min(100, _get_int("EDITORIAL_MCP_MAX_BATCH", 20)))
     mcp_max_list_size: int = max(1, min(500, _get_int("EDITORIAL_MCP_MAX_LIST", 100)))
     mcp_actor_id: int = _get_int("EDITORIAL_MCP_ACTOR_ID", 0)
+    mcp_excluded_bots: tuple[str, ...] = tuple(
+        name.strip().lstrip("@").lower()
+        for name in os.getenv("EDITORIAL_MCP_EXCLUDED_BOTS", DEFAULT_MCP_EXCLUDED_BOTS).split(",")
+        if name.strip()
+    )
+    mcp_snapshot_ttl_hours: int = max(1, _get_int("EDITORIAL_MCP_SNAPSHOT_TTL_HOURS", 24))
+    mcp_snapshot_max_size: int = max(1, min(100, _get_int("EDITORIAL_MCP_SNAPSHOT_MAX_SIZE", 100)))
     legacy_import_batch_size: int = _get_int("EDITORIAL_IMPORT_BATCH_SIZE", 200)
     scheduler_window_minutes: int = _get_int("EDITORIAL_SCHEDULER_WINDOW_MINUTES", 15)
     scheduler_commit_batch_size: int = max(1, _get_int("EDITORIAL_SCHEDULER_COMMIT_BATCH_SIZE", 25))

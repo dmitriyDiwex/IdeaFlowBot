@@ -206,8 +206,7 @@ class ModerationCaseService:
                 )
                 .order_by(Submission.source_message_id.asc(), Submission.id.asc())
             )
-            if submission.source_chat_id is not None:
-                stmt = stmt.where(Submission.source_chat_id == submission.source_chat_id)
+            stmt = stmt.where(Submission.source_chat_id == submission.source_chat_id)
             related = list((await session.execute(stmt)).scalars().all())
         else:
             related = [submission]

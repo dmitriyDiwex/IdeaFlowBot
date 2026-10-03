@@ -850,72 +850,88 @@ class LegacyModerationSyncService:
             .limit(1)
         )
 
+    async def sync_panel_submission_agent_checked(self, submission_id: int, *, decision: str) -> int:
+        state = {"approve": "approved", "reject": "rejected", "advertising": "advertising"}[decision]
+        return await self._sync_panel_review_markup(
+            submission_id, state=state, moderator_label="agent",
+            allow_cancel=decision in {"approve", "reject"}, strict=True,
+        )
+
     async def _sync_panel_review_markup(
-        self,
-        submission_id: int,
-        state: str,
-        *,
-        moderator_label: str | None = None,
-        allow_cancel: bool = False,
+        self, submission_id: int, state: str, *,
+        moderator_label: str | None = None, allow_cancel: bool = False, strict: bool = False,
     ) -> int:
         async with session_factory() as session:
             submission = await session.get(Submission, submission_id)
             if submission is None:
+                if strict:
+                    raise ValueError("Submission missing for Telegram verification")
                 return 0
-
             channel = await session.get(Channel, submission.channel_id)
             if channel is None:
+                if strict:
+                    raise ValueError("Channel missing for Telegram verification")
                 return 0
-
             related_submissions = await self.moderation.get_related_submissions(session, submission)
             submission_by_legacy_row_id = {
-                item.legacy_row_id: item
-                for item in related_submissions
-                if item.legacy_row_id is not None
+                item.legacy_row_id: item for item in related_submissions if item.legacy_row_id is not None
             }
-
         if not submission_by_legacy_row_id:
-            return 0
-
+            return 0  # Native submissions have no legacy Telegram card.
         legacy_rows = await self.legacy_reader.fetch_sender_rows_by_ids(list(submission_by_legacy_row_id))
         review_rows = [
             row for row in legacy_rows
             if row.review_chat_id is not None and row.review_message_id is not None
         ]
+        if strict and (len(review_rows) != len(submission_by_legacy_row_id)):
+            raise ValueError("Some expected Telegram cards are missing")
         if not review_rows:
             return 0
-
+        if strict:
+            # Current albums share a single control card across all sender rows.
+            review_rows = list({
+                (row.review_chat_id, row.review_message_id): row for row in review_rows
+            }.values())
         binding = await self.legacy_reader.get_bot_binding(int(channel.tg_channel_id))
         if binding is None:
+            if strict:
+                raise ValueError("Bot binding missing for expected Telegram cards")
             return 0
-
         bot = AsyncTeleBot(binding.bot_api_token)
         updated_count = 0
-        for row in review_rows:
-            related_submission = submission_by_legacy_row_id.get(row.id)
-            markup = self._build_panel_status_markup(
-                state=state,
-                user_id=row.user_id or (related_submission.source_user_id if related_submission else None),
-                username=row.username or (related_submission.username if related_submission else None),
-                first_name=row.first_name or (related_submission.first_name if related_submission else None),
-                moderator_label=moderator_label,
-                allow_cancel=allow_cancel,
-            )
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=int(row.review_chat_id),
-                    message_id=int(row.review_message_id),
-                    reply_markup=markup,
+        errors = []
+        try:
+            for row in review_rows:
+                related_submission = submission_by_legacy_row_id.get(row.id)
+                markup = self._build_panel_status_markup(
+                    state=state,
+                    user_id=row.user_id or (related_submission.source_user_id if related_submission else None),
+                    username=row.username or (related_submission.username if related_submission else None),
+                    first_name=row.first_name or (related_submission.first_name if related_submission else None),
+                    moderator_label=moderator_label, allow_cancel=allow_cancel,
                 )
-                updated_count += 1
-            except Exception as ex:
-                logger.error(
-                    "Failed to sync panel moderation status '{}' to review message {} in chat {}: {}",
-                    state,
-                    row.review_message_id,
-                    row.review_chat_id,
-                    ex,
-                )
+                try:
+                    response = await bot.edit_message_reply_markup(
+                        chat_id=int(row.review_chat_id), message_id=int(row.review_message_id),
+                        reply_markup=markup,
+                    )
+                    if strict:
+                        actual_markup = getattr(response, "reply_markup", None)
+                        if actual_markup is None or actual_markup.to_dict() != markup.to_dict():
+                            raise ValueError("Telegram did not acknowledge the expected card markup")
+                    updated_count += 1
+                except Exception as ex:
+                    # Re-applying the same keyboard is Telegram's supported status check.
+                    if "message is not modified" in str(ex).lower():
+                        updated_count += 1
+                        continue
+                    errors.append(f"card {row.review_message_id}: {ex}")
+                    logger.error("Failed to sync panel moderation status '{}' to review message {} in chat {}: {}",
+                                 state, row.review_message_id, row.review_chat_id, ex)
+        finally:
+            await bot.close_session()
+        if strict and errors:
+            raise ValueError(f"Telegram cards verified {updated_count}/{len(review_rows)}; " + "; ".join(errors))
         return updated_count
 
     @staticmethod

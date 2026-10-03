@@ -88,3 +88,10 @@ def pick_primary_tag(tags: Iterable[str]) -> str | None:
     for tag in tags:
         return tag
     return None
+
+
+def compute_moderation_hash(text: str | None) -> str | None:
+    """Punctuation-insensitive identity that retains URLs and mentions."""
+    normalized = unicodedata.normalize("NFC", text or "").lower()
+    normalized = re.sub(r"[\W_]+", " ", normalized).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else None

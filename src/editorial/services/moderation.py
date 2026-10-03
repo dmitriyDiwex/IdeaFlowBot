@@ -43,10 +43,17 @@ class ModerationService:
         self,
         session: AsyncSession,
         submission: Submission,
+        *,
+        lock: bool = False,
     ) -> list[Submission]:
         group_key = self._submission_group_key(submission)
         if group_key is None:
-            return [submission]
+            if lock:
+                submission = await session.scalar(
+                    select(Submission).where(Submission.id == submission.id)
+                    .with_for_update().execution_options(populate_existing=True)
+                )
+            return [submission] if submission is not None else []
 
         stmt = (
             select(Submission)
@@ -56,8 +63,9 @@ class ModerationService:
             )
             .order_by(Submission.source_message_id.asc(), Submission.id.asc())
         )
-        if submission.source_chat_id is not None:
-            stmt = stmt.where(Submission.source_chat_id == submission.source_chat_id)
+        stmt = stmt.where(Submission.source_chat_id == submission.source_chat_id)
+        if lock:
+            stmt = stmt.order_by(None).order_by(Submission.id).with_for_update().execution_options(populate_existing=True)
         return list((await session.execute(stmt)).scalars().all())
 
     @staticmethod
