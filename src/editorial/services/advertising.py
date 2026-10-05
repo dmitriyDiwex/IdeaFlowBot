@@ -58,8 +58,9 @@ def build_advertising_alert_text(
     )
 
 
-def resolve_advertising_targets() -> list[int | str]:
-    targets: list[int | str] = []
+def resolve_advertising_targets() -> list[int]:
+    # Personal usernames are mentions, not valid Bot API private-chat targets.
+    targets: list[int] = []
     seen: set[str] = set()
 
     for advertiser_id in settings.advertiser:
@@ -75,15 +76,6 @@ def resolve_advertising_targets() -> list[int | str]:
         if key not in seen:
             seen.add(key)
             targets.append(int(manager_chat_id))
-
-    username = (settings.advertising_manager_username or "").strip()
-    if username:
-        if not username.startswith("@"):
-            username = f"@{username}"
-        key = f"user:{username.lower()}"
-        if key not in seen:
-            seen.add(key)
-            targets.append(username)
 
     return targets
 
@@ -105,6 +97,17 @@ async def send_advertising_flow(
     sender_first_name: str | None,
     strict: bool = False,
 ) -> None:
+    targets = resolve_advertising_targets()
+    if not targets:
+        message = (
+            "Advertising manager notification is not configured: set "
+            "ADVERTISING_MANAGER_CHAT_ID or ADVERTISER_IDS; "
+            "ADVERTISING_MANAGER_USERNAME is only used in the reply text"
+        )
+        if strict:
+            raise ValueError(message)
+        logger.warning(message)
+
     await bot.send_message(chat_id=recipient_user_id, text=build_advertising_reply_text())
 
     advertiser_message = build_advertising_alert_text(
@@ -119,7 +122,7 @@ async def send_advertising_flow(
 
     errors = []
     try:
-        for target in resolve_advertising_targets():
+        for target in targets:
             try:
                 await alert_bot.send_message(
                     chat_id=target,
@@ -128,7 +131,7 @@ async def send_advertising_flow(
                 )
             except Exception as ex:
                 logger.error("Failed to send advertising alert to {}: {}", target, ex)
-                errors.append(str(ex))
+                errors.append(f"chat_id={target}: {ex}")
     finally:
         if strict and alert_bot is not bot:
             await alert_bot.close_session()
