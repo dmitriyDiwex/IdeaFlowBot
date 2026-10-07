@@ -33,7 +33,7 @@ from src.editorial.services.statistics_export import (
     validate_statistics_delta_days,
 )
 from src.editorial.services.telegram_actions import TelegramEditorialActions
-from src.editorial.services.suggestion_ad_service import suggestion_ad_html
+from src.editorial.services.suggestion_ad_service import suggestion_ad_html, suggestion_confirmation_html
 from src.confession_publisher import ConfessionPublisherRuntime
 from src.telegram_runtime import calculate_telegram_request_limit
 from src.panel_markups import (
@@ -383,10 +383,10 @@ class MasterBot:
         text_html = await self.editorial_actions.get_suggestion_ad_text()
         text = (
             "Настройка рекламы предложек.\n\n"
-            "Общий текст для подслушек и признавашек. Реклама отправляется после "
-            "1-го сообщения человека, затем после 6-го, 11-го и далее через каждые 5. "
-            "Счётчик отдельный для каждого человека в каждом паблике. "
-            "Альбом считается одним обращением.\n\n"
+            "Общий текст для подслушек и признавашек. Реклама добавляется снизу "
+            "в сообщение о приёме на модерацию, через пустую строку. "
+            "Добавляется в каждое подтверждение приёма. "
+            "Для альбома отправляется одно подтверждение.\n\n"
             "Текущий текст (HTML):\n"
             + (text_html or "Текст пока не задан — реклама не отправляется.")
         )
@@ -397,7 +397,7 @@ class MasterBot:
         tags = await self.editorial_actions.list_suggestion_ad_exclusions()
         text = (
             "Исключения для рекламы в предложках.\n"
-            "В этих пабликах подслушек и признавашек реклама после сообщений не отправляется.\n\n"
+            "В этих пабликах подслушек и признавашек реклама не добавляется в подтверждение приёма.\n\n"
             + ("\n".join(f"{index}. @{tag}" for index, tag in enumerate(tags, start=1))
                if tags else "Список пока пуст.")
         )
@@ -421,7 +421,8 @@ class MasterBot:
                 'Отправьте рекламный текст одним сообщением. Можно использовать HTML, '
                 'например <b>Текст</b> и <tg-emoji emoji-id="123456789">👍</tg-emoji>, '
                 'или прислать готовое сообщение с форматированием и кастомными эмодзи. '
-                'Перед сохранением бот покажет предпросмотр.',
+                'Текст добавится снизу в подтверждение приёма на модерацию. '
+                'Перед сохранением бот покажет предпросмотр вместе с подтверждением.',
                 reply_markup=build_suggestion_ads_panel(),
             )
         else:
@@ -444,7 +445,7 @@ class MasterBot:
                 # Let Telegram validate HTML/length before replacing the saved advertisement.
                 await self.main_bot.send_message(
                     chat_id=message.chat.id,
-                    text=text_html,
+                    text=suggestion_confirmation_html(settings.send_post_msg, text_html),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )

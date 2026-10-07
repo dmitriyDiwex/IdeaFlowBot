@@ -78,6 +78,11 @@ def _formatted_ad_html(text: str, entities: list[MessageEntity]) -> str:
     return render(0, len(utf16) // 2)
 
 
+def suggestion_confirmation_html(confirmation_text: str, text_html: str | None = None) -> str:
+    text = escape(confirmation_text, quote=False)
+    return f"{text}\n\n{text_html}" if text_html else text
+
+
 def suggestion_ad_html(message: Message) -> str:
     """Accept literal Telegram HTML or preserve formatting/custom emoji entities."""
     raw = (message.text or "").strip()
@@ -140,7 +145,7 @@ class SuggestionAdService:
         channel_tag: str | None,
         user_id: int,
     ) -> str | None:
-        """Atomically count eligible submissions per user/channel: ads at 1, 6, 11…"""
+        """Count eligible submissions and return the configured ad for every one."""
         text_html = await self.get_text(session)
         if not text_html:
             return None
@@ -154,9 +159,9 @@ class SuggestionAdService:
         statement = insert(SuggestionAdCounter).values(
             channel_tg_id=channel_tg_id, user_id=user_id, submission_count=1,
         )
-        count = await session.scalar(statement.on_conflict_do_update(
+        await session.execute(statement.on_conflict_do_update(
             index_elements=[SuggestionAdCounter.channel_tg_id, SuggestionAdCounter.user_id],
             set_={"submission_count": SuggestionAdCounter.submission_count + 1},
-        ).returning(SuggestionAdCounter.submission_count))
+        ))
         await session.commit()
-        return text_html if (count - 1) % 5 == 0 else None
+        return text_html

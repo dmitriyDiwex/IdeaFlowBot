@@ -25,7 +25,10 @@ from src.editorial.services.publication_signature import (
     should_add_publication_signature,
 )
 from src.editorial.services.telegram_resilience import is_transient_telegram_error
-from src.editorial.services.suggestion_ad_service import SuggestionAdService
+from src.editorial.services.suggestion_ad_service import (
+    SuggestionAdService,
+    suggestion_confirmation_html,
+)
 from src.legacy_delayed import delayed_publication_matches
 from src.legacy_media_groups import (
     LegacyMediaGroupReference,
@@ -248,7 +251,7 @@ class SubBot:
             if info_subscribe.status != "left":
                 markup = None
                 if not is_command:
-                    message_text = self.send_post_msg
+                    return
 
             await self.sup_bot.send_message(message.chat.id, message_text, reply_markup=markup)
 
@@ -405,14 +408,16 @@ class SubBot:
         @self.sup_bot.message_handler(content_types=["text", "photo", "video", "animation"])
         async def get_suggest(message: Message) -> None:
             logger.info(f"channel: {self.channel_username}, sender: {message.chat.id, message.chat.username}")
+            if message.chat.id == self.chat_suggest or message.chat.id < 0:
+                return
+
             info_subscribe = await self.sup_bot.get_chat_member(user_id=message.chat.id, chat_id=self.channel_id)
-            await start(message, is_command=False)
             if info_subscribe.status == "left":
+                await start(message, is_command=False)
                 logger.info("user not in channel")
                 return
 
-            if message.chat.id == self.chat_suggest or message.chat.id < 0:
-                return
+            await __check_exist_user(message)
 
             if await Utils().check_banned_user(message.chat.id, self.channel_id):
                 await self.sup_bot.send_message(chat_id=message.chat.id, text=self.ban_usr_msg)
@@ -1055,9 +1060,10 @@ class SubBot:
         await self._save_incoming_message(message, review_message)
         await self._notify_new_submission(review_message)
         if review_message is not None:
-            await self._send_suggestion_ad(message)
+            await self._send_submission_confirmation(message)
 
-    async def _send_suggestion_ad(self, message: Message) -> None:
+    async def _send_submission_confirmation(self, message: Message) -> None:
+        text_html = None
         try:
             async with session_factory() as session:
                 text_html = await self.suggestion_ad_service.record_submission(
@@ -1066,16 +1072,26 @@ class SubBot:
                     channel_tag=self.channel_username,
                     user_id=message.chat.id,
                 )
-            if text_html:
+        except Exception as exc:
+            # Ad settings must never prevent the acceptance confirmation.
+            logger.warning("Failed to load suggestion ad for channel {}: {}", self.channel_id, exc)
+
+        try:
+            try:
                 await self.sup_bot.send_message(
                     chat_id=message.chat.id,
-                    text=text_html,
+                    text=suggestion_confirmation_html(self.send_post_msg, text_html),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
+            except ApiTelegramException as exc:
+                if not text_html or exc.error_code != 400:
+                    raise
+                # Invalid/oversized saved ads must not hide the confirmation.
+                logger.warning("Suggestion ad rejected for channel {}: {}", self.channel_id, exc)
+                await self.sup_bot.send_message(chat_id=message.chat.id, text=self.send_post_msg)
         except Exception as exc:
-            # An advertisement must never interrupt collection or moderation.
-            logger.warning("Failed to send suggestion ad for channel {}: {}", self.channel_id, exc)
+            logger.warning("Failed to send submission confirmation for channel {}: {}", self.channel_id, exc)
 
     async def _notify_new_submission(self, review_message) -> None:
         if self.callback_new_submission is None or review_message is None:
@@ -1174,7 +1190,7 @@ class SubBot:
             await self._save_incoming_message(message, control_message)
 
         await self._notify_new_submission(control_message)
-        await self._send_suggestion_ad(messages[0])
+        await self._send_submission_confirmation(messages[0])
 
     async def _copy_media_group_to_current_legacy_chat(self, messages: list[Message]):
         return await self.sup_bot.copy_messages(

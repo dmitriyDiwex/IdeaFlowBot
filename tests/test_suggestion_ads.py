@@ -1,4 +1,5 @@
 import asyncio
+from html import escape
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,7 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot.asyncio_helper import ApiTelegramException
 from telebot.types import CallbackQuery, Message, MessageEntity, User
 
+from config import settings
 from src.editorial.db.base import EditorialBase
 from src.editorial.models.suggestion_ad import SuggestionAdCounter, SuggestionAdExclusion, SuggestionAdSettings
 from src.editorial.services.suggestion_ad_service import (
@@ -24,6 +26,9 @@ from src.panel_markups import (
     build_suggestion_ads_panel,
 )
 from src.worker import SubBot
+
+
+CONFIRMATION = "Сообщение принято на модерацию. A < B & C"
 
 
 AD = '<b>Реклама</b> <tg-emoji emoji-id="5368324170671202286">👍</tg-emoji>'
@@ -51,18 +56,21 @@ async def _record(factory, *, user=123, channel=-1001, tag="@Overheard"):
 
 
 @pytest.mark.asyncio
-async def test_ads_at_first_sixth_eleventh_with_persistent_independent_counters(ad_sessions):
+@pytest.mark.parametrize("initial_count", [0, 1, 4, 5, 6, 11])
+async def test_ads_on_every_submission_regardless_of_existing_counter(ad_sessions, initial_count):
     async with ad_sessions() as session:
         await SuggestionAdService().set_text(session, text_html=AD)
+        if initial_count:
+            session.add(SuggestionAdCounter(channel_tg_id=-1001, user_id=123, submission_count=initial_count))
+            await session.commit()
     results = [await _record(ad_sessions) for _ in range(12)]
-    assert [index for index, ad in enumerate(results, start=1) if ad] == [1, 6, 11]
-    assert all(ad == AD for ad in results if ad)
+    assert results == [AD] * 12
     assert await _record(ad_sessions, user=456) == AD
     assert await _record(ad_sessions, channel=-1002, tag="@Confessions") == AD
     async with ad_sessions() as session:
         assert await session.scalar(select(SuggestionAdCounter.submission_count).where(
             SuggestionAdCounter.channel_tg_id == -1001, SuggestionAdCounter.user_id == 123,
-        )) == 12
+        )) == initial_count + 12
 
 
 @pytest.mark.asyncio
@@ -70,20 +78,20 @@ async def test_concurrent_submissions_do_not_lose_counter_updates(ad_sessions):
     async with ad_sessions() as session:
         await SuggestionAdService().set_text(session, text_html=AD)
     results = await asyncio.gather(*[_record(ad_sessions) for _ in range(11)])
-    assert results.count(AD) == 3
+    assert results == [AD] * 11
     async with ad_sessions() as session:
         assert await session.scalar(select(SuggestionAdCounter.submission_count)) == 11
 
 
 @pytest.mark.asyncio
-async def test_ad_text_change_preserves_cadence(ad_sessions):
+async def test_ad_text_change_applies_to_next_submission(ad_sessions):
     service = SuggestionAdService()
     async with ad_sessions() as session:
         await service.set_text(session, text_html=AD)
     assert await _record(ad_sessions) == AD
     async with ad_sessions() as session:
         await service.set_text(session, text_html="<i>Новая реклама</i>")
-    assert [await _record(ad_sessions) for _ in range(4)] == [None] * 4
+    assert [await _record(ad_sessions) for _ in range(4)] == ["<i>Новая реклама</i>"] * 4
     assert await _record(ad_sessions) == "<i>Новая реклама</i>"
 
 
@@ -205,7 +213,8 @@ async def test_text_is_previewed_as_html_before_saving():
     assert await master._handle_stateful_admin_text(message)
     master.editorial_actions.set_suggestion_ad_text.assert_awaited_once_with(text_html=AD)
     assert master.main_bot.send_message.await_args_list[0].kwargs == {
-        "chat_id": 123, "text": AD, "parse_mode": "HTML", "disable_web_page_preview": True,
+        "chat_id": 123, "text": escape(settings.send_post_msg, quote=False) + "\n\n" + AD,
+        "parse_mode": "HTML", "disable_web_page_preview": True,
     }
     assert 123 not in master.user_states
 
@@ -239,44 +248,158 @@ async def test_admin_entered_tag_updates_exclusions(state, method):
 
 
 @pytest.mark.asyncio
-async def test_single_submission_sends_ad_only_after_successful_review():
+async def test_single_submission_confirms_only_after_successful_review():
     subbot = SubBot.__new__(SubBot)
     message = SimpleNamespace(chat=SimpleNamespace(id=123))
     review = SimpleNamespace(message_id=11)
     subbot._send_review_message_to_legacy_chat = AsyncMock(return_value=review)
     subbot._save_incoming_message = AsyncMock()
     subbot._notify_new_submission = AsyncMock()
-    subbot._send_suggestion_ad = AsyncMock()
+    subbot._send_submission_confirmation = AsyncMock()
     await subbot._process_single_submission(message)
     subbot._save_incoming_message.assert_awaited_once_with(message, review)
-    subbot._send_suggestion_ad.assert_awaited_once_with(message)
-    subbot._send_suggestion_ad.reset_mock()
+    subbot._send_submission_confirmation.assert_awaited_once_with(message)
+    subbot._send_submission_confirmation.reset_mock()
     subbot._send_review_message_to_legacy_chat.return_value = None
     await subbot._process_single_submission(message)
-    subbot._send_suggestion_ad.assert_not_awaited()
+    subbot._send_submission_confirmation.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_subbot_sends_custom_emoji_html_and_handles_delivery_failure(ad_sessions, monkeypatch):
-    monkeypatch.setattr("src.worker.session_factory", ad_sessions)
-    async with ad_sessions() as session:
-        await SuggestionAdService().set_text(session, text_html=AD)
+def _subbot():
     subbot = SubBot.__new__(SubBot)
     subbot.channel_id = -1001
     subbot.channel_username = "@Overheard"
+    subbot.send_post_msg = CONFIRMATION
     subbot.suggestion_ad_service = SuggestionAdService()
     subbot.sup_bot = SimpleNamespace(send_message=AsyncMock())
+    return subbot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag", ["@Overheard", "@Confessions"])
+async def test_subbot_appends_ad_to_every_confirmation(ad_sessions, monkeypatch, tag):
+    monkeypatch.setattr("src.worker.session_factory", ad_sessions)
+    async with ad_sessions() as session:
+        await SuggestionAdService().set_text(session, text_html=AD)
+    subbot = _subbot()
+    subbot.channel_username = tag
     message = SimpleNamespace(chat=SimpleNamespace(id=123))
-    await subbot._send_suggestion_ad(message)
+    for _ in range(11):
+        subbot.sup_bot.send_message.reset_mock()
+        await subbot._send_submission_confirmation(message)
+        expected = escape(CONFIRMATION, quote=False) + "\n\n" + AD
+        subbot.sup_bot.send_message.assert_awaited_once_with(
+            chat_id=123, text=expected, parse_mode="HTML", disable_web_page_preview=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excluded", [False, True])
+async def test_missing_ad_or_exclusion_still_sends_confirmation(ad_sessions, monkeypatch, excluded):
+    monkeypatch.setattr("src.worker.session_factory", ad_sessions)
+    if excluded:
+        async with ad_sessions() as session:
+            service = SuggestionAdService()
+            await service.set_text(session, text_html=AD)
+            await service.add_exclusion(session, channel_tag="@Overheard")
+    subbot = _subbot()
+    await subbot._send_submission_confirmation(SimpleNamespace(chat=SimpleNamespace(id=123)))
     subbot.sup_bot.send_message.assert_awaited_once_with(
-        chat_id=123, text=AD, parse_mode="HTML", disable_web_page_preview=True,
+        chat_id=123, text=escape(CONFIRMATION, quote=False),
+        parse_mode="HTML", disable_web_page_preview=True,
     )
-    subbot.sup_bot.send_message.reset_mock()
-    await subbot._send_suggestion_ad(message)
-    subbot.sup_bot.send_message.assert_not_awaited()
-    subbot.sup_bot.send_message.side_effect = RuntimeError("Telegram unavailable")
-    # A different user is due their first ad; a failed ad does not escape into collection.
-    await subbot._send_suggestion_ad(SimpleNamespace(chat=SimpleNamespace(id=456)))
+
+
+@pytest.mark.asyncio
+async def test_ad_database_failure_still_sends_confirmation(ad_sessions, monkeypatch):
+    monkeypatch.setattr("src.worker.session_factory", ad_sessions)
+    subbot = _subbot()
+    subbot.suggestion_ad_service.record_submission = AsyncMock(side_effect=RuntimeError("DB unavailable"))
+    await subbot._send_submission_confirmation(SimpleNamespace(chat=SimpleNamespace(id=123)))
+    subbot.sup_bot.send_message.assert_awaited_once_with(
+        chat_id=123, text=escape(CONFIRMATION, quote=False),
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error_code", "description", "attempts"), [
+    (400, "Bad Request: can't parse entities", 2),
+    (400, "Bad Request: message is too long", 2),
+    (403, "Forbidden: bot was blocked by the user", 1),
+    (500, "Internal Server Error", 1),
+])
+async def test_rejected_ad_falls_back_to_confirmation_without_retrying_other_errors(
+    ad_sessions, monkeypatch, error_code, description, attempts,
+):
+    monkeypatch.setattr("src.worker.session_factory", ad_sessions)
+    async with ad_sessions() as session:
+        await SuggestionAdService().set_text(session, text_html=AD)
+    subbot = _subbot()
+    subbot.sup_bot.send_message.side_effect = [
+        ApiTelegramException("sendMessage", None, {"error_code": error_code, "description": description}),
+        None,
+    ]
+    await subbot._send_submission_confirmation(SimpleNamespace(chat=SimpleNamespace(id=123)))
+    assert subbot.sup_bot.send_message.await_count == attempts
+    if attempts == 2:
+        subbot.sup_bot.send_message.assert_awaited_with(chat_id=123, text=CONFIRMATION)
+
+
+@pytest.mark.asyncio
+async def test_album_sends_one_confirmation_with_ad_and_counts_once(ad_sessions, monkeypatch):
+    monkeypatch.setattr("src.worker.session_factory", ad_sessions)
+    async with ad_sessions() as session:
+        await SuggestionAdService().set_text(session, text_html=AD)
+    subbot = _subbot()
+    subbot.chat_suggest = -10055
+    subbot._save_incoming_message = AsyncMock()
+    subbot._notify_new_submission = AsyncMock()
+    subbot.sup_bot.copy_messages = AsyncMock(return_value=[SimpleNamespace(message_id=501), SimpleNamespace(message_id=502)])
+    subbot.sup_bot.get_chat = AsyncMock(return_value=SimpleNamespace(username="author"))
+    subbot.sup_bot.send_message.return_value = SimpleNamespace(message_id=503)
+    messages = [SimpleNamespace(message_id=number, chat=SimpleNamespace(id=123)) for number in [11, 12]]
+    await subbot._send_media_group_to_legacy_chat(messages)
+    private_calls = [call for call in subbot.sup_bot.send_message.await_args_list if call.kwargs["chat_id"] == 123]
+    assert len(private_calls) == 1
+    assert private_calls[0].kwargs["text"] == escape(CONFIRMATION, quote=False) + "\n\n" + AD
+    async with ad_sessions() as session:
+        assert await session.scalar(select(SuggestionAdCounter.submission_count)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["single", "album", "banned", "unsubscribed", "no_review_chat", "group"])
+async def test_suggestion_handler_does_not_send_early_acceptance(case, monkeypatch):
+    subbot = _subbot()
+    subbot.bot_info = SimpleNamespace(username="suggest_bot", id=99)
+    subbot.users_data = {123}
+    subbot.chat_suggest = -10055
+    subbot.ban_usr_msg = "Вы заблокированы"
+    subbot.sup_bot = AsyncTeleBot("1:test")
+    subbot.sup_bot.send_message = AsyncMock()
+    subbot.sup_bot.get_chat_member = AsyncMock(return_value=SimpleNamespace(status="left" if case == "unsubscribed" else "member"))
+    subbot._refresh_chat_suggest = AsyncMock(return_value=None if case == "no_review_chat" else -10055)
+    subbot._process_single_submission = AsyncMock()
+    subbot._queue_media_group = AsyncMock()
+    monkeypatch.setattr("src.worker.Utils.check_banned_user", AsyncMock(return_value=case == "banned"))
+    await subbot._SubBot__setup_handlers()
+    message = Message.de_json({
+        "message_id": 11, "date": 0,
+        "chat": {"id": -10055 if case == "group" else 123, "type": "group" if case == "group" else "private"},
+        "from": {"id": 123, "is_bot": False, "first_name": "Author"},
+        "text": "Предложка", **({"media_group_id": "album-1"} if case == "album" else {}),
+    })
+    await subbot.sup_bot.process_new_messages([message])
+    if case in {"single", "album"}:
+        subbot.sup_bot.send_message.assert_not_awaited()
+        if case == "single":
+            subbot._process_single_submission.assert_awaited_once_with(message)
+        else:
+            subbot._queue_media_group.assert_awaited_once_with(message)
+    else:
+        subbot._process_single_submission.assert_not_awaited()
+        subbot._queue_media_group.assert_not_awaited()
+        assert all(CONFIRMATION not in str(call) for call in subbot.sup_bot.send_message.await_args_list)
 
 
 @pytest.mark.parametrize(("text", "entities", "expected"), [
@@ -361,10 +484,11 @@ async def test_panel_handlers_replace_persisted_ad_text(ad_sessions, monkeypatch
     payload.update(text=text, entities=[entity.to_dict() for entity in entities])
     await master.main_bot.process_new_messages([Message.de_json(payload)])
     assert master.main_bot.send_message.await_args_list[0].kwargs == {
-        "chat_id": 123, "text": expected, "parse_mode": "HTML", "disable_web_page_preview": True,
+        "chat_id": 123, "text": escape(settings.send_post_msg, quote=False) + "\n\n" + expected,
+        "parse_mode": "HTML", "disable_web_page_preview": True,
     }
     async with ad_sessions() as session:
         assert await service.get_text(session) == expected
     assert 123 not in master.user_states
-    assert [await _record(ad_sessions) for _ in range(4)] == [None] * 4
+    assert [await _record(ad_sessions) for _ in range(4)] == [expected] * 4
     assert await _record(ad_sessions) == expected
