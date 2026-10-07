@@ -4,8 +4,11 @@ from xml.etree import ElementTree
 from zipfile import ZipFile
 
 import pytest
+from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.editorial.models.channel import Channel
+from src.editorial.models.enums import SubmissionStatus
 from src.editorial.services.statistics_export import (
     ChannelStatisticsRow,
     StatisticsExportService,
@@ -26,6 +29,7 @@ def test_statistics_export_writes_minimal_xlsx(tmp_path) -> None:
                 subscriber_count=123,
                 delta_count=7,
                 submission_count=11,
+                pending_submission_count=3,
             )
         ],
         delta_days=10,
@@ -45,7 +49,11 @@ def test_statistics_export_writes_minimal_xlsx(tmp_path) -> None:
     assert "<v>123</v>" in sheet_xml
     assert "<v>7</v>" in sheet_xml
     assert "<v>11</v>" in sheet_xml
-    assert 'autoFilter ref="A1:E2"' in sheet_xml
+    assert 'autoFilter ref="A1:F2"' in sheet_xml
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    sheet = ElementTree.fromstring(sheet_xml)
+    assert sheet.find('x:sheetData/x:row/x:c[@r="F1"]/x:is/x:t', namespace).text == "Необработанных сообщений"
+    assert sheet.find('x:sheetData/x:row/x:c[@r="F2"]/x:v', namespace).text == "3"
 
 
 def test_statistics_export_sorts_and_colors_subscriber_bands(tmp_path) -> None:
@@ -126,7 +134,9 @@ async def test_statistics_rows_count_real_submissions_in_requested_period() -> N
     counts_result = MagicMock()
     counts_result.all.return_value = [(channel.id, 5)]
     session = MagicMock()
-    session.execute = AsyncMock(side_effect=[channels_result, counts_result])
+    pending_result = MagicMock()
+    pending_result.all.return_value = [(channel.id, 3)]
+    session.execute = AsyncMock(side_effect=[channels_result, counts_result, pending_result])
     session.scalar = AsyncMock(return_value=None)
 
     rows = await StatisticsExportService()._build_rows(
@@ -144,6 +154,7 @@ async def test_statistics_rows_count_real_submissions_in_requested_period() -> N
             subscriber_count=123,
             delta_count=None,
             submission_count=5,
+            pending_submission_count=3,
         ),
         ChannelStatisticsRow(
             title="Channel B",
@@ -189,3 +200,60 @@ def test_statistics_delta_days_validation() -> None:
 
     with pytest.raises(ValueError):
         validate_statistics_delta_days("abc")
+
+
+@pytest.mark.asyncio
+async def test_pending_counts_include_all_new_and_held_messages_at_export_time(tmp_path) -> None:
+    # A minimal SQL table exercises the real aggregate without PostgreSQL-only JSONB fields.
+    metadata = MetaData()
+    submissions = Table(
+        "submissions", metadata,
+        Column("id", Integer, primary_key=True),
+        Column("channel_id", Integer, nullable=False),
+        Column("status", String, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("source_chat_id", BigInteger),
+    )
+    now = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
+    cases = [
+        (42, SubmissionStatus.NEW, now - timedelta(days=60), None),
+        (42, SubmissionStatus.HOLD, now - timedelta(days=20), 123),
+        (42, SubmissionStatus.NEW, now, 123),
+        (42, SubmissionStatus.HOLD, now + timedelta(seconds=1), 123),
+        (42, SubmissionStatus.NEW, now, -100123),
+        (42, SubmissionStatus.HOLD, now, -100123),
+        (43, SubmissionStatus.NEW, now, 456),
+        (44, SubmissionStatus.NEW, now, 789),
+    ]
+    cases.extend(
+        (42, status, now, 123)
+        for status in SubmissionStatus
+        if status not in {SubmissionStatus.NEW, SubmissionStatus.HOLD}
+    )
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'statistics.db'}")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(metadata.create_all)
+            await connection.execute(submissions.insert(), [
+                {"id": index, "channel_id": channel_id, "status": status.value,
+                 "created_at": created_at, "source_chat_id": source_chat_id}
+                for index, (channel_id, status, created_at, source_chat_id) in enumerate(cases, start=1)
+            ])
+        sessions = async_sessionmaker(engine)
+        async with sessions() as session:
+            counts = await StatisticsExportService._pending_submission_counts(
+                session, channel_ids=[42, 43, 45], ended_at=now,
+            )
+        assert counts == {42: 3, 43: 1}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pending_counts_skip_query_without_channels() -> None:
+    session = MagicMock()
+    session.execute = AsyncMock()
+    assert await StatisticsExportService._pending_submission_counts(
+        session, channel_ids=[], ended_at=datetime(2026, 10, 7, tzinfo=timezone.utc),
+    ) == {}
+    session.execute.assert_not_awaited()

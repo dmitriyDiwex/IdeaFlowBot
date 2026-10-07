@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from telebot.async_telebot import AsyncTeleBot
 from telebot.asyncio_helper import ApiTelegramException
-from telebot.types import MessageEntity
+from telebot.types import CallbackQuery, Message, MessageEntity, User
 
 from src.editorial.db.base import EditorialBase
 from src.editorial.models.suggestion_ad import SuggestionAdCounter, SuggestionAdExclusion, SuggestionAdSettings
@@ -15,6 +16,7 @@ from src.editorial.services.suggestion_ad_service import (
     normalize_suggestion_channel_tag,
     suggestion_ad_html,
 )
+from src.editorial.services.telegram_actions import TelegramEditorialActions
 from src.master import MasterBot
 from src.panel_markups import (
     build_extra_panel,
@@ -275,3 +277,94 @@ async def test_subbot_sends_custom_emoji_html_and_handles_delivery_failure(ad_se
     subbot.sup_bot.send_message.side_effect = RuntimeError("Telegram unavailable")
     # A different user is due their first ad; a failed ad does not escape into collection.
     await subbot._send_suggestion_ad(SimpleNamespace(chat=SimpleNamespace(id=456)))
+
+
+@pytest.mark.parametrize(("text", "entities", "expected"), [
+    (
+        "🔥Текст & ссылка",
+        [MessageEntity(type="url", offset=10, length=6),
+         MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id="12345"),
+         MessageEntity(type="bold", offset=0, length=16),
+         MessageEntity(type="italic", offset=2, length=5)],
+        '<b><tg-emoji emoji-id="12345">🔥</tg-emoji><i>Текст</i> &amp; ссылка</b>',
+    ),
+    (
+        "🔥 & текст",
+        [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id="12345"),
+         MessageEntity(type="bold", offset=0, length=2)],
+        '<b><tg-emoji emoji-id="12345">🔥</tg-emoji></b> &amp; текст',
+    ),
+    (
+        "Ссылка и текст",
+        [MessageEntity(type="text_link", offset=0, length=6, url='https://example.com/?a=1&b="2"'),
+         MessageEntity(type="bold", offset=0, length=6),
+         MessageEntity(type="spoiler", offset=9, length=5)],
+        '<a href="https://example.com/?a=1&amp;b=&quot;2&quot;"><b>Ссылка</b></a> и <span class="tg-spoiler">текст</span>',
+    ),
+    (
+        "A < B & C",
+        [MessageEntity(type="pre", offset=0, length=9, language="python")],
+        '<pre><code class="language-python">A &lt; B &amp; C</code></pre>',
+    ),
+    (
+        "Иван: цитата",
+        [MessageEntity(type="text_mention", offset=0, length=4,
+                       user=User(id=123, is_bot=False, first_name="Иван")),
+         MessageEntity(type="expandable_blockquote", offset=6, length=6)],
+        '<a href="tg://user?id=123">Иван</a>: <blockquote expandable>цитата</blockquote>',
+    ),
+])
+def test_formatted_ad_preserves_nested_and_adjacent_entities(text, entities, expected):
+    assert suggestion_ad_html(SimpleNamespace(text=text, entities=entities)) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "entities", "expected"), [
+    ("Новая реклама & текст", [], "Новая реклама &amp; текст"),
+    ("<i>Новая реклама</i>", [], "<i>Новая реклама</i>"),
+    (
+        "🔥Новая реклама https://t.me/channel",
+        [MessageEntity(type="bold", offset=0, length=15),
+         MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id="12345"),
+         MessageEntity(type="url", offset=16, length=20)],
+        '<b><tg-emoji emoji-id="12345">🔥</tg-emoji>Новая реклама</b> https://t.me/channel',
+    ),
+])
+async def test_panel_handlers_replace_persisted_ad_text(ad_sessions, monkeypatch, text, entities, expected):
+    monkeypatch.setattr("src.master.settings.general_admin", 123)
+    monkeypatch.setattr("src.editorial.services.telegram_actions.session_factory", ad_sessions)
+    service = SuggestionAdService()
+    async with ad_sessions() as session:
+        await service.set_text(session, text_html=AD)
+    assert await _record(ad_sessions) == AD
+
+    master = _master()
+    master.editorial_actions = TelegramEditorialActions.__new__(TelegramEditorialActions)
+    master.editorial_actions.suggestion_ad_service = service
+    master.main_bot = AsyncTeleBot("1:test")
+    master.main_bot.send_message = AsyncMock()
+    master.main_bot.answer_callback_query = AsyncMock()
+    master._MasterBot__setup_handlers()
+    payload = {
+        "message_id": 1, "date": 0, "chat": {"id": 123, "type": "private"},
+        "from": {"id": 123, "is_bot": False, "first_name": "Admin"},
+        "text": "Настройка рекламы",
+    }
+    callback = CallbackQuery.de_json({
+        "id": "ad-text", "from": payload["from"], "chat_instance": "123",
+        "message": payload, "data": "panel:suggestion_ad_text",
+    })
+    await master.main_bot.process_new_callback_query([callback])
+    assert master.user_states[123]["action"] == "await_suggestion_ad_text"
+    master.main_bot.send_message.reset_mock()
+
+    payload.update(text=text, entities=[entity.to_dict() for entity in entities])
+    await master.main_bot.process_new_messages([Message.de_json(payload)])
+    assert master.main_bot.send_message.await_args_list[0].kwargs == {
+        "chat_id": 123, "text": expected, "parse_mode": "HTML", "disable_web_page_preview": True,
+    }
+    async with ad_sessions() as session:
+        assert await service.get_text(session) == expected
+    assert 123 not in master.user_states
+    assert [await _record(ad_sessions) for _ in range(4)] == [None] * 4
+    assert await _record(ad_sessions) == expected

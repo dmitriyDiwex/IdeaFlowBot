@@ -6,8 +6,7 @@ import re
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from telebot.formatting import apply_html_entities
-from telebot.types import Message
+from telebot.types import Message, MessageEntity
 
 from src.editorial.models.suggestion_ad import (
     SuggestionAdCounter,
@@ -23,6 +22,62 @@ def normalize_suggestion_channel_tag(value: str | None) -> str:
     return tag
 
 
+def _formatted_ad_html(text: str, entities: list[MessageEntity]) -> str:
+    """Render nested Telegram entities using their original UTF-16 offsets."""
+    tags = {
+        "bold": ("<b>", "</b>"),
+        "italic": ("<i>", "</i>"),
+        "underline": ("<u>", "</u>"),
+        "strikethrough": ("<s>", "</s>"),
+        "spoiler": ('<span class="tg-spoiler">', "</span>"),
+        "code": ("<code>", "</code>"),
+        "blockquote": ("<blockquote>", "</blockquote>"),
+        "expandable_blockquote": ("<blockquote expandable>", "</blockquote>"),
+    }
+    spans = []
+    for entity in entities:
+        if entity.type == "text_link":
+            opening, closing = f'<a href="{escape(entity.url, quote=True)}">', "</a>"
+        elif entity.type == "text_mention":
+            opening, closing = f'<a href="tg://user?id={entity.user.id}">', "</a>"
+        elif entity.type == "custom_emoji":
+            opening = f'<tg-emoji emoji-id="{escape(entity.custom_emoji_id, quote=True)}">'
+            closing = "</tg-emoji>"
+        elif entity.type == "pre":
+            if entity.language:
+                language = escape(entity.language, quote=True)
+                opening, closing = f'<pre><code class="language-{language}">', "</code></pre>"
+            else:
+                opening, closing = "<pre>", "</pre>"
+        elif entity.type in tags:
+            opening, closing = tags[entity.type]
+        else:
+            # URLs, mentions and other automatic entities remain plain text.
+            continue
+        spans.append((entity.offset, entity.offset + entity.length, opening, closing))
+    spans.sort(key=lambda span: (span[0], -span[1], span[2].startswith("<tg-emoji")))
+    utf16 = text.encode("utf-16-le")
+    index = 0
+
+    def escaped(start: int, end: int) -> str:
+        return escape(utf16[start * 2:end * 2].decode("utf-16-le"), quote=False)
+
+    def render(start: int, end: int) -> str:
+        nonlocal index
+        parts = []
+        cursor = start
+        while index < len(spans) and spans[index][0] < end:
+            left, right, opening, closing = spans[index]
+            index += 1
+            parts.append(escaped(cursor, left))
+            parts.append(opening + render(left, right) + closing)
+            cursor = right
+        parts.append(escaped(cursor, end))
+        return "".join(parts)
+
+    return render(0, len(utf16) // 2)
+
+
 def suggestion_ad_html(message: Message) -> str:
     """Accept literal Telegram HTML or preserve formatting/custom emoji entities."""
     raw = (message.text or "").strip()
@@ -33,7 +88,7 @@ def suggestion_ad_html(message: Message) -> str:
     entities = getattr(message, "entities", None)
     if entities:
         # Entity offsets refer to the untrimmed text and use UTF-16 code units.
-        return apply_html_entities(message.text, entities).strip()
+        return _formatted_ad_html(message.text, entities).strip()
     return escape(raw, quote=False)
 
 

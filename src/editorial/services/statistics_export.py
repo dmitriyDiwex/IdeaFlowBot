@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core_database.config import BASE_DIR
 from src.editorial.models.channel import Channel, ChannelSubscriberSnapshot
 from src.editorial.models.submission import Submission
+from src.editorial.models.enums import SubmissionStatus
 
 
 MAX_STATISTICS_DELTA_DAYS = 14
@@ -35,6 +36,7 @@ class ChannelStatisticsRow:
     subscriber_count: int | None
     delta_count: int | None
     submission_count: int
+    pending_submission_count: int = 0
 
 
 class StatisticsExportService:
@@ -91,6 +93,11 @@ class StatisticsExportService:
             started_at=now - timedelta(days=delta_days),
             ended_at=now,
         )
+        pending_counts = await self._pending_submission_counts(
+            session,
+            channel_ids=[channel.id for channel in channels],
+            ended_at=now,
+        )
         rows: list[ChannelStatisticsRow] = []
 
         for channel in channels:
@@ -125,6 +132,7 @@ class StatisticsExportService:
                     subscriber_count=current_count,
                     delta_count=delta_count,
                     submission_count=submission_counts.get(channel.id, 0),
+                    pending_submission_count=pending_counts.get(channel.id, 0),
                 )
             )
         return rows
@@ -145,6 +153,28 @@ class StatisticsExportService:
             .where(
                 Submission.channel_id.in_(channel_ids),
                 Submission.created_at >= started_at,
+                Submission.created_at <= ended_at,
+                or_(Submission.source_chat_id.is_(None), Submission.source_chat_id >= 0),
+            )
+            .group_by(Submission.channel_id)
+        )
+        return {int(channel_id): int(count) for channel_id, count in result.all()}
+
+    @staticmethod
+    async def _pending_submission_counts(
+        session: AsyncSession,
+        *,
+        channel_ids: list[int],
+        ended_at: datetime,
+    ) -> dict[int, int]:
+        if not channel_ids:
+            return {}
+
+        result = await session.execute(
+            select(Submission.channel_id, func.count(Submission.id))
+            .where(
+                Submission.channel_id.in_(channel_ids),
+                Submission.status.in_([SubmissionStatus.NEW, SubmissionStatus.HOLD]),
                 Submission.created_at <= ended_at,
                 or_(Submission.source_chat_id.is_(None), Submission.source_chat_id >= 0),
             )
@@ -191,10 +221,12 @@ class StatisticsExportService:
                 "\u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438",
                 f"\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435 \u0437\u0430 {delta_days} \u0434\u043d.",
                 f"\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0439 \u0432 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u043a\u0443 \u0437\u0430 {delta_days} \u0434\u043d.",
+                "Необработанных сообщений",
             ],
         ]
         sheet_rows.extend(
-            [row.title, row.tag, row.subscriber_count, row.delta_count, row.submission_count]
+            [row.title, row.tag, row.subscriber_count, row.delta_count, row.submission_count,
+             row.pending_submission_count]
             for row in sorted_rows
         )
 
@@ -252,7 +284,7 @@ class StatisticsExportService:
                     cells.append(f'<c r="{ref}" t="inlineStr"{style}><is><t>{text}</t></is></c>')
             row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
 
-        filter_ref = f"A1:E{max(len(rows), 1)}"
+        filter_ref = f"A1:F{max(len(rows), 1)}"
         sort_state = (
             f'<sortState ref="{filter_ref}"><sortCondition ref="C2:C{len(rows)}" '
             'descending="1"/></sortState>'
@@ -269,7 +301,7 @@ class StatisticsExportService:
             '<col min="1" max="1" width="34" customWidth="1"/>'
             '<col min="2" max="2" width="24" customWidth="1"/>'
             '<col min="3" max="4" width="18" customWidth="1"/>'
-            '<col min="5" max="5" width="32" customWidth="1"/>'
+            '<col min="5" max="6" width="32" customWidth="1"/>'
             '</cols>'
             f'<sheetData>{"".join(row_xml)}</sheetData>'
             f'<autoFilter ref="{filter_ref}">{sort_state}</autoFilter>'
