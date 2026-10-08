@@ -17,6 +17,24 @@ class TelegramOperationTimeout(TimeoutError):
     """A bounded Telegram operation exceeded the application's wall-clock limit."""
 
 
+class PartialTelegramCopyError(RuntimeError):
+    """Some destination messages exist; retrying the album would duplicate them."""
+
+    def __init__(self, expected_count: int, copied_message_ids: list[int]) -> None:
+        self.copied_message_ids = copied_message_ids
+        super().__init__(
+            f"Telegram copied {len(copied_message_ids)} of {expected_count} album messages; "
+            f"destination IDs: {copied_message_ids}. Automatic retry is disabled."
+        )
+
+
+def validate_album_copy(expected_count: int, copied_message_ids: list[int]) -> None:
+    if not copied_message_ids:
+        raise RuntimeError("Telegram returned no copied media group messages")
+    if len(copied_message_ids) != expected_count or len(set(copied_message_ids)) != expected_count:
+        raise PartialTelegramCopyError(expected_count, copied_message_ids)
+
+
 class TelegramAPIError(RuntimeError):
     """Telegram Bot API returned a structured non-success response."""
 

@@ -1,0 +1,226 @@
+[
+  {
+    "album": "14330782950989250",
+    "source_chat_id": 1000,
+    "rows": [
+      {
+        "id": 51609,
+        "message_id": 63444,
+        "content_type": "photo",
+        "caption": "Album caption"
+      },
+      {
+        "id": 51610,
+        "message_id": 63445,
+        "content_type": "photo",
+        "caption": null
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 51609,
+        "status": "content_created",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  },
+  {
+    "album": "14330113262157898",
+    "source_chat_id": 1001,
+    "rows": [
+      {
+        "id": 50087,
+        "message_id": 63395,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 50088,
+        "message_id": 63396,
+        "content_type": "photo",
+        "caption": "Album caption"
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 50087,
+        "status": "content_created",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  },
+  {
+    "album": "14328256609309786",
+    "source_chat_id": 1002,
+    "rows": [
+      {
+        "id": 47207,
+        "message_id": 63193,
+        "content_type": "photo",
+        "caption": "Album caption"
+      },
+      {
+        "id": 47208,
+        "message_id": 63194,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47209,
+        "message_id": 63195,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47210,
+        "message_id": 63196,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47211,
+        "message_id": 63197,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47212,
+        "message_id": 63198,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47213,
+        "message_id": 63199,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47214,
+        "message_id": 63200,
+        "content_type": "photo",
+        "caption": null
+      },
+      {
+        "id": 47215,
+        "message_id": 63201,
+        "content_type": "photo",
+        "caption": null
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 47207,
+        "status": "rejected",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  },
+  {
+    "album": "14320593041952826",
+    "source_chat_id": 1003,
+    "rows": [
+      {
+        "id": 33796,
+        "message_id": 61854,
+        "content_type": "photo",
+        "caption": "Album caption"
+      },
+      {
+        "id": 33797,
+        "message_id": 61855,
+        "content_type": "photo",
+        "caption": null
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 33796,
+        "status": "content_created",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  },
+  {
+    "album": "14317766203828906",
+    "source_chat_id": 1004,
+    "rows": [
+      {
+        "id": 29787,
+        "message_id": 61505,
+        "content_type": "photo",
+        "caption": "Album caption"
+      },
+      {
+        "id": 29788,
+        "message_id": 61506,
+        "content_type": "photo",
+        "caption": null
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 29787,
+        "status": "content_created",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  },
+  {
+    "album": "14311576607751442",
+    "source_chat_id": 1005,
+    "rows": [
+      {
+        "id": 20473,
+        "message_id": 60801,
+        "content_type": "photo",
+        "caption": "Album caption"
+      },
+      {
+        "id": 20474,
+        "message_id": 60802,
+        "content_type": "photo",
+        "caption": null
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 20473,
+        "status": "content_created",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  },
+  {
+    "album": "14310931713002594",
+    "source_chat_id": 1006,
+    "rows": [
+      {
+        "id": 19740,
+        "message_id": 60745,
+        "content_type": "photo",
+        "caption": "Album caption"
+      },
+      {
+        "id": 19741,
+        "message_id": 60746,
+        "content_type": "photo",
+        "caption": null
+      }
+    ],
+    "existing": [
+      {
+        "legacy_row_id": 19740,
+        "status": "content_created",
+        "is_anonymous": true,
+        "reviewed": true
+      }
+    ]
+  }
+]

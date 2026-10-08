@@ -24,7 +24,9 @@ from src.editorial.services.publication_signature import (
     publication_signature_html,
     should_add_publication_signature,
 )
-from src.editorial.services.telegram_resilience import is_transient_telegram_error
+from src.editorial.services.telegram_resilience import (
+    is_transient_telegram_error, PartialTelegramCopyError, validate_album_copy,
+)
 from src.editorial.services.suggestion_ad_service import (
     SuggestionAdService,
     suggestion_confirmation_html,
@@ -667,6 +669,14 @@ class SubBot:
                             timeout=settings.telegram_request_timeout_seconds,
                         )
                     except Exception as ex:
+                        if isinstance(ex, PartialTelegramCopyError):
+                            await self.legacy_moderation_sync.mark_legacy_delayed_delivery_uncertain(
+                                channel_tg_id=self.channel_id,
+                                review_chat_id=call.message.chat.id,
+                                review_message_id=call.message.message_id,
+                                error_text=str(ex),
+                            )
+                            return
                         if not is_transient_telegram_error(ex):
                             logger.error("Permanent legacy publication error: {}", ex)
                             try:
@@ -1507,7 +1517,7 @@ class SubBot:
             raise
         except Exception as ex:
             try:
-                if is_transient_telegram_error(ex):
+                if isinstance(ex, PartialTelegramCopyError) or is_transient_telegram_error(ex):
                     await self.legacy_moderation_sync.mark_legacy_delayed_delivery_uncertain(
                         channel_tg_id=self.channel_id,
                         review_chat_id=self.chat_suggest,
@@ -1557,8 +1567,10 @@ class SubBot:
                 chat_id=self.channel_id,
                 message_ids=media_group.source_message_ids,
             )
-            if not copied_messages:
-                raise RuntimeError("Telegram returned no copied delayed media group messages")
+            validate_album_copy(
+                len(media_group.source_message_ids),
+                [int(item.message_id) for item in copied_messages],
+            )
             copied_message = copied_messages[0]
             caption_index = min(media_group.caption_index, len(copied_messages) - 1)
             published_caption_message = copied_messages[caption_index]

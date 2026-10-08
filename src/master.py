@@ -1646,6 +1646,34 @@ class MasterBot:
             except Exception as ex:
                 logger.error("Failed to deliver submission notification to {}: {}", recipient_id, ex)
 
+    async def _send_panel_text(
+        self, chat_id: int, text: str, *, reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        """Keep plain-text panel messages within Telegram's size limit."""
+        remaining = text
+        chunks: list[str] = []
+        while remaining:
+            units = 0
+            end = 0
+            for char in remaining:
+                width = 2 if ord(char) > 0xFFFF else 1
+                if units + width > 4000:
+                    break
+                units += width
+                end += 1
+            if end < len(remaining):
+                # Keep slot rows intact; exceptionally long lines are split safely.
+                newline = remaining.rfind("\n", 0, end)
+                if newline >= 0:
+                    end = newline + 1
+            chunks.append(remaining[:end])
+            remaining = remaining[end:]
+        for index, chunk in enumerate(chunks):
+            await self.main_bot.send_message(
+                chat_id, chunk,
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
+
     async def _show_channel_slots_menu(self, chat_id: int, channel_id: int) -> None:
         await self.editorial_actions.sync_channel_activity_from_bindings()
         channel = await self.editorial_actions.get_channel(channel_id)
@@ -1669,7 +1697,7 @@ class MasterBot:
                     slot_label = f"{slot_label} auto"
                 slot_lines.append(f"#{slot.id} {slot_label}")
 
-        await self.main_bot.send_message(
+        await self._send_panel_text(
             chat_id,
             "\n".join(slot_lines),
             reply_markup=build_channel_slots_actions(channel_id),
@@ -2282,7 +2310,6 @@ class MasterBot:
         if channel is None or channel.content_family != ContentFamily.CONFESSION.value:
             await self.main_bot.send_message(chat_id, "Паблик признавашек не найден.")
             return
-        slots = await self.editorial_actions.list_channel_slots(channel_id)
         ad_blackouts = await self.editorial_actions.list_channel_ad_blackouts(channel_id)
         settings_snapshot = await self.editorial_actions.get_channel_settings_snapshot(channel_id)
         effective_user_id = user_id if user_id is not None else chat_id
@@ -2337,25 +2364,12 @@ class MasterBot:
             "",
             "Ключевые параметры:",
             *summary_lines,
-            "",
-            "Слоты:",
         ]
-        if slots:
-            lines.extend(
-                (
-                    f"#{slot.id} {self._weekday_label(slot.weekday)} "
-                    f"{slot.slot_time.strftime('%H:%M')}"
-                    f"{' auto' if getattr(slot, 'is_auto_managed', False) else ''}"
-                )
-                for slot in slots
-            )
-        else:
-            lines.append("Слотов пока нет.")
         if ad_blackouts:
             lines.extend(["", "Рекламные окна:"])
             for blackout in ad_blackouts:
                 lines.append(await self._format_ad_blackout(channel_id, blackout))
-        await self.main_bot.send_message(
+        await self._send_panel_text(
             chat_id,
             "\n".join(lines),
             reply_markup=build_confession_channel_actions(

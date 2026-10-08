@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core_database.models.bots_data import BotsData
 from src.core_database.models.db_helper import db_helper as legacy_db_helper
 from src.core_database.models.sender_info import SenderData
+from src.editorial.models.channel import Channel
+from src.editorial.models.submission import Submission
 
 
 @dataclass(slots=True)
@@ -39,6 +42,67 @@ class LegacySenderRow:
 
 class LegacyCollectorReader:
     """Read-only bridge to the current legacy collector database."""
+
+    @staticmethod
+    def _sender_select():
+        return select(*(getattr(SenderData, name) for name in LegacySenderRow.__dataclass_fields__))
+
+    async def fetch_sender_media_group_rows(
+        self, *, channel_id: int, source_chat_id: int, media_group_id: str,
+    ) -> list[LegacySenderRow]:
+        async with legacy_db_helper.engine.connect() as conn:
+            result = await conn.execute(
+                self._sender_select().where(
+                    SenderData.channel_id == channel_id,
+                    SenderData.chat_id == source_chat_id,
+                    SenderData.media_group_id == media_group_id,
+                ).order_by(SenderData.message_id, SenderData.id)
+            )
+            return [LegacySenderRow(**row) for row in result.mappings()]
+
+    async def fetch_unimported_sender_rows(
+        self, session: AsyncSession, *, limit: int = 200,
+    ) -> list[LegacySenderRow]:
+        """Find gaps as well as new rows; moderation can import out of order."""
+        if session.bind.url == legacy_db_helper.engine.url:
+            imported = select(Submission.id).where(
+                Submission.legacy_source == "sender_info",
+                Submission.legacy_row_id == SenderData.id,
+            ).exists()
+            result = await session.execute(
+                self._sender_select()
+                .join(Channel, Channel.tg_channel_id == SenderData.channel_id)
+                .where(
+                    ~imported,
+                    or_(
+                        SenderData.chat_id.is_(None), SenderData.chat_id >= 0,
+                        SenderData.review_chat_id.is_not(None),
+                        SenderData.review_message_id.is_not(None),
+                    ),
+                ).order_by(SenderData.id).limit(limit)
+            )
+            return [LegacySenderRow(**row) for row in result.mappings()]
+
+        # A separate SQLite collector cannot join the editorial database.
+        # Compare bounded batches, including old IDs, instead of using MAX(id).
+        channel_ids = set((await session.scalars(select(Channel.tg_channel_id))).all())
+        missing: list[LegacySenderRow] = []
+        after_id = 0
+        while len(missing) < limit:
+            rows = await self.fetch_sender_rows(after_id=after_id, limit=200)
+            if not rows:
+                break
+            after_id = max(row.id for row in rows)
+            imported_ids = set((await session.scalars(select(Submission.legacy_row_id).where(
+                Submission.legacy_source == "sender_info",
+                Submission.legacy_row_id.in_([row.id for row in rows]),
+            ))).all())
+            missing.extend(row for row in rows if (
+                row.id not in imported_ids and row.channel_id in channel_ids
+                and not (row.chat_id is not None and row.chat_id < 0
+                         and row.review_chat_id is None and row.review_message_id is None)
+            ))
+        return missing[:limit]
 
     async def fetch_sender_rows(self, after_id: int = 0, limit: int = 200) -> list[LegacySenderRow]:
         async with legacy_db_helper.engine.connect() as conn:

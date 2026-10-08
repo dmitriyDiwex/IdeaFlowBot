@@ -9,6 +9,7 @@ from src.editorial.services.publication_signature import (
     should_add_publication_signature,
 )
 from src.legacy_media_groups import LegacyMediaGroupReference
+from src.editorial.services.telegram_resilience import validate_album_copy
 from src.utils import Utils
 from config import settings
 
@@ -555,8 +556,7 @@ class MarkupButton:
                     message_ids=media_group.source_message_ids,
                 )
                 copied_message_ids = [int(item.message_id) for item in copied_messages]
-                if not copied_message_ids:
-                    raise RuntimeError("Telegram returned no copied media group messages")
+                validate_album_copy(len(media_group.source_message_ids), copied_message_ids)
                 published_message_id = copied_message_ids[0]
                 caption_index = min(media_group.caption_index, len(copied_message_ids) - 1)
                 published_caption_message_id = copied_message_ids[caption_index]

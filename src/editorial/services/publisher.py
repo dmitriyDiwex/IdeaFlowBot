@@ -24,6 +24,7 @@ from src.editorial.models.publication import PublicationLog
 from src.editorial.models.submission import Submission
 from src.editorial.services.legacy_audit import LEGACY_DELAYED_AUDIT_TEMPLATE_KEY
 from src.editorial.services.legacy_source import LegacyCollectorReader, LegacySenderRow
+from src.editorial.services.import_legacy import LegacyImporter
 from src.legacy_publication_status import LegacyPublicationStatusService
 from src.editorial.services.paste_service import PasteService
 from src.editorial.services.confession_service import ConfessionService
@@ -37,6 +38,8 @@ from src.editorial.services.scheduler import SchedulerService
 from src.editorial.services.telegram_publisher import TelegramPublisherAdapter
 from src.editorial.services.telegram_resilience import (
     is_transient_telegram_error,
+    PartialTelegramCopyError,
+    validate_album_copy,
     publisher_retry_delay,
 )
 from src.editorial.utils.text import clean_text
@@ -276,17 +279,24 @@ class PublisherService:
         related_legacy_rows = await self._get_related_legacy_rows(related_rows)
 
         if submission.media_group_id:
-            stmt = (
-                select(Submission)
-                .where(
-                    Submission.channel_id == submission.channel_id,
-                    Submission.media_group_id == submission.media_group_id,
+            if getattr(submission, "legacy_row_id", None) is not None:
+                if not related_legacy_rows:
+                    raise ValueError("Legacy album source row is missing")
+                related_rows = await LegacyImporter(self.legacy_reader).ensure_media_group_submissions(
+                    session, related_legacy_rows[0],
                 )
-                .order_by(Submission.source_message_id.asc(), Submission.id.asc())
-            )
-            if submission.source_chat_id is not None:
-                stmt = stmt.where(Submission.source_chat_id == submission.source_chat_id)
-            related_rows = list(((await session.execute(stmt)).scalars().all()))
+            else:
+                stmt = (
+                    select(Submission)
+                    .where(
+                        Submission.channel_id == submission.channel_id,
+                        Submission.media_group_id == submission.media_group_id,
+                    )
+                    .order_by(Submission.source_message_id.asc(), Submission.id.asc())
+                )
+                if submission.source_chat_id is not None:
+                    stmt = stmt.where(Submission.source_chat_id == submission.source_chat_id)
+                related_rows = list(((await session.execute(stmt)).scalars().all()))
             related_legacy_rows = await self._get_related_legacy_rows(related_rows)
             review_rows = [
                 row for row in related_legacy_rows
@@ -297,6 +307,8 @@ class PublisherService:
                 for item in related_rows
                 if item.source_message_id is not None
             ]
+            if not related_rows or len(set(source_message_ids)) != len(source_message_ids):
+                raise ValueError("Media group has missing or duplicate source references")
             review_message_ids = [int(row.review_message_id) for row in review_rows]
             if (
                 submission.source_chat_id is not None
@@ -339,8 +351,7 @@ class PublisherService:
                 from_chat_id=from_chat_id,
                 message_ids=message_ids,
             )
-            if not copied_message_ids:
-                raise RuntimeError("Telegram returned no copied media group messages")
+            validate_album_copy(len(message_ids), copied_message_ids)
 
             if formatted_caption != source_text and not caption_too_long:
                 caption_index = next(
@@ -636,6 +647,9 @@ class PublisherService:
                 result.sent += 1
                 published_content_item_id = int(content_item.id)
             except Exception as ex:
+                if isinstance(ex, PartialTelegramCopyError):
+                    # Record evidence of the partial delivery without requeueing it.
+                    log_item.telegram_message_id = ex.copied_message_ids[0]
                 if is_transient_telegram_error(ex):
                     self.defer_transient_publication(
                         log_item=log_item,

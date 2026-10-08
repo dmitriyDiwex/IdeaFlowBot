@@ -11,7 +11,9 @@ from telebot.async_telebot import AsyncTeleBot, asyncio_helper
 
 from config import settings as legacy_settings
 from src.editorial.config import settings
-from src.editorial.services.telegram_resilience import TelegramAPIError, run_telegram_operation
+from src.editorial.services.telegram_resilience import (
+    TelegramAPIError, run_telegram_operation, validate_album_copy,
+)
 
 
 @dataclass(slots=True)
@@ -190,9 +192,9 @@ class TelegramPublisherAdapter:
             raise TelegramAPIError(result)
 
         copied_items = result.get("result") or []
-        if not copied_items:
-            raise RuntimeError("Telegram returned no copied messages")
-        return [int(item["message_id"]) for item in copied_items]
+        copied_message_ids = [int(item["message_id"]) for item in copied_items]
+        validate_album_copy(len(message_ids), copied_message_ids)
+        return copied_message_ids
 
     async def edit_message_caption(
         self,

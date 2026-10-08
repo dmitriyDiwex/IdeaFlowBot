@@ -7,6 +7,8 @@ import re
 from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.editorial.config import settings
 from src.editorial.models.channel import Channel
@@ -17,6 +19,7 @@ from src.editorial.services.tag_service import TagService
 from src.editorial.utils.text import (
     clean_text,
     compute_raw_text_hash,
+    compute_moderation_hash,
     compute_text_hash,
     detect_language_code,
     normalize_text,
@@ -211,6 +214,7 @@ class LegacyImporter:
             "cleaned_text": cleaned_text or None,
             "normalized_text": normalized_text or None,
             "text_hash": text_hash,
+            "moderation_normalized_hash": compute_moderation_hash(cleaned_text or raw_text),
             "detected_tags": await self.tag_service.detect_tags(session, cleaned_text),
             "language_code": detect_language_code(cleaned_text),
             "is_candidate_for_generation": len(cleaned_text) >= settings.minimum_submission_length,
@@ -218,10 +222,51 @@ class LegacyImporter:
             "created_at": created_at,
         }
 
+    async def ensure_media_group_submissions(
+        self, session: AsyncSession, row: LegacySenderRow,
+    ) -> list[Submission]:
+        if not row.media_group_id or row.chat_id is None:
+            raise ValueError("Legacy album has no source chat or media group ID")
+        rows = await self.legacy_reader.fetch_sender_media_group_rows(
+            channel_id=row.channel_id,
+            source_chat_id=row.chat_id,
+            media_group_id=row.media_group_id,
+        )
+        if len(rows) < 2 or row.id not in {item.id for item in rows}:
+            raise ValueError("Legacy album is incomplete in sender_info")
+        message_ids = [item.message_id for item in rows]
+        if None in message_ids or len(set(message_ids)) != len(rows) or any(
+            (item.channel_id, item.chat_id, item.media_group_id)
+            != (row.channel_id, row.chat_id, row.media_group_id) for item in rows
+        ):
+            raise ValueError("Legacy album has invalid or duplicate source references")
+        submissions = []
+        for item in rows:
+            submission = await self._ensure_single_submission_for_legacy_row(session, item)
+            if submission is None:
+                raise ValueError(f"Could not import legacy album row {item.id}")
+            if (submission.source_chat_id, submission.source_message_id, submission.media_group_id) != (
+                item.chat_id, item.message_id, item.media_group_id,
+            ):
+                raise ValueError(f"Legacy album row {item.id} has inconsistent submission references")
+            submissions.append(submission)
+        return submissions
+
     async def ensure_submission_for_legacy_row(
+        self, session: AsyncSession, row: LegacySenderRow,
+    ) -> Submission | None:
+        if row.id is None or self._is_service_moderation_copy(row):
+            return None
+        if row.media_group_id:
+            related = await self.ensure_media_group_submissions(session, row)
+            return next(item for item in related if item.legacy_row_id == row.id)
+        return await self._ensure_single_submission_for_legacy_row(session, row)
+
+    async def _ensure_single_submission_for_legacy_row(
         self,
         session: AsyncSession,
         row: LegacySenderRow,
+        channel_id: int | None = None,
     ) -> Submission | None:
         if row.id is None or self._is_service_moderation_copy(row):
             return None
@@ -237,31 +282,44 @@ class LegacyImporter:
         if existing is not None:
             return existing
 
-        await self.sync_channels(session)
-        channel_id = await session.scalar(
-            select(Channel.id)
-            .where(Channel.tg_channel_id == row.channel_id)
-            .limit(1)
-        )
+        if channel_id is None:
+            await self.sync_channels(session)
+            channel_id = await session.scalar(
+                select(Channel.id).where(Channel.tg_channel_id == row.channel_id).limit(1)
+            )
         if channel_id is None:
             logger.warning("Skipping legacy row {} because channel {} is unknown", row.id, row.channel_id)
             return None
 
-        submission = Submission(**await self._build_submission_payload(session, row, channel_id))
-        session.add(submission)
-        await session.flush()
-        return submission
+        payload = await self._build_submission_payload(session, row, channel_id)
+        if row.media_group_id:
+            sibling = await session.scalar(select(Submission).where(
+                Submission.channel_id == channel_id,
+                Submission.source_chat_id == row.chat_id,
+                Submission.media_group_id == row.media_group_id,
+            ).order_by(Submission.reviewed_at.desc().nullslast(), Submission.id).limit(1))
+            if sibling is not None:
+                # Backfilled media belongs to the existing moderation decision.
+                # It must not reappear as a new proposal or lose anonymity.
+                payload.update(
+                    status=sibling.status, is_anonymous=sibling.is_anonymous,
+                    reviewed_at=sibling.reviewed_at, moderator_note=sibling.moderator_note,
+                )
+        insert = sqlite_insert if session.bind.dialect.name == "sqlite" else pg_insert
+        # Collector callbacks and the importer can discover the same row together.
+        await session.execute(insert(Submission).values(**payload).on_conflict_do_nothing(
+            index_elements=[Submission.legacy_source, Submission.legacy_row_id],
+        ))
+        return await session.scalar(select(Submission).where(
+            Submission.legacy_source == "sender_info", Submission.legacy_row_id == row.id,
+        ))
 
     async def import_new(self, session: AsyncSession, limit: int | None = None) -> ImportLegacyResult:
         result = ImportLegacyResult()
         result.channels_created = await self.sync_channels(session)
 
-        last_id = await session.scalar(
-            select(func.max(Submission.legacy_row_id)).where(Submission.legacy_source == "sender_info")
-        )
-        rows = await self.legacy_reader.fetch_sender_rows(
-            after_id=last_id or 0,
-            limit=limit or settings.legacy_import_batch_size,
+        rows = await self.legacy_reader.fetch_unimported_sender_rows(
+            session, limit=limit or settings.legacy_import_batch_size,
         )
 
         if not rows:
@@ -300,8 +358,9 @@ class LegacyImporter:
                 result.skipped_duplicates += 1
                 continue
 
-            submission = Submission(**await self._build_submission_payload(session, row, channels[row.channel_id]))
-            session.add(submission)
+            await self._ensure_single_submission_for_legacy_row(
+                session, row, channel_id=channels[row.channel_id],
+            )
             result.imported += 1
 
         repaired_count = await self.repair_moderation_copy_links(session)

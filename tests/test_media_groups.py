@@ -626,3 +626,58 @@ async def test_panel_prefers_rebuilt_album_over_separate_legacy_copies() -> None
 
     master._send_submission_preview_fallback.assert_awaited_once_with(1001, preview)
     master.main_bot.copy_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_immediate_partial_album_copy_is_not_reported_as_sent(monkeypatch):
+    from src.editorial.services.telegram_resilience import PartialTelegramCopyError
+
+    bot = SimpleNamespace(
+        token="1:test", get_chat=AsyncMock(return_value=SimpleNamespace(id=1001, username="author")),
+        copy_messages=AsyncMock(return_value=[SimpleNamespace(message_id=701)]),
+        send_message=AsyncMock(), edit_message_reply_markup=AsyncMock(), edit_message_caption=AsyncMock(),
+    )
+    monkeypatch.setattr("src.markups.should_add_publication_signature", AsyncMock(return_value=False))
+    call = SimpleNamespace(data="send_suggest;1001", message=SimpleNamespace(
+        message_id=503, chat=SimpleNamespace(id=-10055), content_type="text",
+        text="Media group controls", caption=None,
+    ))
+    album = LegacyMediaGroupReference(1001, [11, 12], "Caption", 0)
+    with pytest.raises(PartialTelegramCopyError, match="1 of 2"):
+        await MarkupButton(bot).send_suggest(call, "@channel", -10077, False, media_group=album)
+    bot.copy_messages.assert_awaited_once()
+    bot.edit_message_reply_markup.assert_not_awaited()
+    bot.edit_message_caption.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_delayed_partial_album_copy_keeps_claim_and_suppresses_retry(monkeypatch):
+    from src.editorial.services.telegram_resilience import PartialTelegramCopyError
+
+    bot = SimpleNamespace(token="1:test",
+        copy_messages=AsyncMock(return_value=[SimpleNamespace(message_id=701)]),
+        get_chat=AsyncMock(return_value=SimpleNamespace(username="author")),
+        edit_message_reply_markup=AsyncMock(),
+    )
+    subbot = SubBot.__new__(SubBot)
+    subbot.sup_bot = bot
+    subbot.bot_info = SimpleNamespace(id=7)
+    subbot.channel_id, subbot.chat_suggest = -10077, -10055
+    subbot.channel_username = subbot.channel_signature_ref = "@channel"
+    subbot.channel_title = "Channel"
+    subbot.delayed_message, subbot.anonym_send = {503: [100, 1001]}, set()
+    subbot.delayed_database = SimpleNamespace(delete_delayed_posts=AsyncMock())
+    subbot._get_review_media_group = AsyncMock(return_value=LegacyMediaGroupReference(1001, [11, 12], "Caption", 0))
+    subbot.legacy_moderation_sync = SimpleNamespace(
+        claim_legacy_delayed_delivery=AsyncMock(return_value=True),
+        mark_legacy_delayed_delivery_uncertain=AsyncMock(), mark_legacy_delayed_published=AsyncMock(),
+        release_legacy_publication_claim=AsyncMock(),
+    )
+    monkeypatch.setattr("src.worker.should_add_publication_signature", AsyncMock(return_value=False))
+    with pytest.raises(PartialTelegramCopyError, match="1 of 2"):
+        await subbot.send_delayed_message(503, 1001, 100)
+    subbot.legacy_moderation_sync.mark_legacy_delayed_delivery_uncertain.assert_awaited_once()
+    subbot.legacy_moderation_sync.release_legacy_publication_claim.assert_not_awaited()
+    subbot.legacy_moderation_sync.mark_legacy_delayed_published.assert_not_awaited()
+    assert (await subbot.send_delayed_message(503, 1001, 100)) is False
+    bot.copy_messages.assert_awaited_once()
