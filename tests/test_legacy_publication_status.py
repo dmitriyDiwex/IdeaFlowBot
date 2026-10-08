@@ -104,12 +104,8 @@ async def test_published_content_updates_legacy_review_with_approving_admin(monk
     assert edit_kwargs["chat_id"] == review_row.review_chat_id
     assert edit_kwargs["message_id"] == review_row.review_message_id
     assert edit_kwargs["reply_markup"].to_dict()["inline_keyboard"] == [
-        [
-            {
-                "text": "@review_admin (опубликовано)",
-                "callback_data": "add_info;1001",
-            }
-        ]
+        [{"text": "👤 1001", "callback_data": "add_info;1001"}],
+        [{"text": "✅ @review_admin (опубликовано)", "callback_data": "add_info;987654321"}],
     ]
     bot.close_session.assert_awaited_once()
     synced_sources = session.add_all.call_args.args[0]

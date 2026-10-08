@@ -1,4 +1,4 @@
-from telebot import formatting
+from html import escape
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from loguru import logger
@@ -44,7 +44,7 @@ def build_slot_status_markup(
         else moderator_first_name or str(moderator_id)
     )
     markup = InlineKeyboardMarkup(row_width=1)
-    show_sender_row = bool(sender_username or sender_first_name or always_show_sender)
+    show_sender_row = bool(sender_id or sender_username or sender_first_name or always_show_sender)
     if show_sender_row:
         markup.add(
             InlineKeyboardButton(
@@ -56,7 +56,7 @@ def build_slot_status_markup(
         status_callback_id = moderator_id
     else:
         status_prefix = ""
-        status_callback_id = sender_id or 0
+        status_callback_id = moderator_id
     markup.add(
         InlineKeyboardButton(
             text=f"{status_prefix}{moderator_text} ({status_labels[state]})",
@@ -352,13 +352,39 @@ class MarkupButton:
 
     @logger.catch
     async def add_info(self, call: CallbackQuery):
-        info = await self.bot.get_chat(call.data.split(";")[1])
-        user = formatting.escape_markdown(info.username)
-        msg = "информация: \n" + f"id: `{info.id}`\n" + f"username @{user}\n" + f"name: `{info.first_name}`"
+        try:
+            user_id = int(call.data.split(";", 1)[1])
+            if not 0 < user_id <= 2**63 - 1:
+                raise ValueError("Invalid Telegram user ID")
+        except (AttributeError, IndexError, TypeError, ValueError):
+            await self.bot.send_message(
+                chat_id=call.message.chat.id,
+                text="В этой карточке не сохранён Telegram ID пользователя.",
+            )
+            return
+
+        try:
+            info = await self.bot.get_chat(user_id)
+        except Exception:
+            logger.warning("Cannot fetch Telegram profile for user {}", user_id)
+            username_text = "недоступен"
+            name_text = "недоступно"
+        else:
+            username = (getattr(info, "username", None) or "").strip().lstrip("@")
+            if not username or username.lower() == "none":
+                username = "None"
+            username_text = f"@{username}"
+            name_text = getattr(info, "first_name", None) or "—"
+
         await self.bot.send_message(
             chat_id=call.message.chat.id,
-            text=msg,
-            parse_mode="Markdown",
+            text=(
+                "Информация о пользователе:\n"
+                f"TG ID: <code>{user_id}</code>\n"
+                f"username: {escape(username_text)}\n"
+                f"name: {escape(name_text)}"
+            ),
+            parse_mode="HTML",
         )
 
     async def get_main_menu_markup(

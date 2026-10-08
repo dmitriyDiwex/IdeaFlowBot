@@ -40,8 +40,11 @@ async def test_legacy_approval_saves_admin_who_pressed_button(callback_data):
 
 
 @pytest.mark.asyncio
-async def test_approved_slot_button_shows_moderator_username() -> None:
-    bot = SimpleNamespace(edit_message_reply_markup=AsyncMock())
+async def test_approved_slot_keeps_author_when_profile_lookup_fails() -> None:
+    bot = SimpleNamespace(
+        edit_message_reply_markup=AsyncMock(),
+        get_chat=AsyncMock(side_effect=TimeoutError("timed out")),
+    )
 
     await MarkupButton(bot).approve_to_slot_button(
         chat_id=-100123,
@@ -55,10 +58,14 @@ async def test_approved_slot_button_shows_moderator_username() -> None:
     markup = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
     markup_dict = markup.to_dict()
     assert markup_dict["inline_keyboard"][0][0] == {
-        "text": "@review_admin (одобрено в слот)",
+        "text": "👤 1001",
         "callback_data": "add_info;1001",
     }
     assert markup_dict["inline_keyboard"][1][0] == {
+        "text": "✅ @review_admin (одобрено в слот)",
+        "callback_data": "add_info;987654321",
+    }
+    assert markup_dict["inline_keyboard"][2][0] == {
         "text": "↩️ Отменить слот",
         "callback_data": "cancel_approve_to_slot;1001",
     }
@@ -75,12 +82,8 @@ def test_published_slot_button_keeps_moderator_username_and_removes_cancel() -> 
 
     markup_dict = markup.to_dict()
     assert markup_dict["inline_keyboard"] == [
-        [
-            {
-                "text": "@review_admin (опубликовано)",
-                "callback_data": "add_info;1001",
-            }
-        ]
+        [{"text": "👤 1001", "callback_data": "add_info;1001"}],
+        [{"text": "✅ @review_admin (опубликовано)", "callback_data": "add_info;987654321"}],
     ]
 
 
@@ -93,7 +96,10 @@ def test_slot_status_falls_back_to_moderator_name_without_username() -> None:
         state="published",
     )
 
-    assert markup.to_dict()["inline_keyboard"][0][0]["text"] == "Admin (опубликовано)"
+    assert markup.to_dict()["inline_keyboard"][1][0] == {
+        "text": "✅ Admin (опубликовано)",
+        "callback_data": "add_info;987654321",
+    }
 
 
 @pytest.mark.asyncio
