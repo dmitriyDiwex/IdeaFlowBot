@@ -533,7 +533,7 @@ class SchedulerService:
                 (ContentItem.publish_after.is_(None) | (ContentItem.publish_after <= slot_dt)),
                 (ContentItem.expires_at.is_(None) | (ContentItem.expires_at > slot_dt)),
             )
-            .order_by(priority_case.asc(), ContentItem.priority.asc(), ContentItem.created_at.asc())
+            .order_by(priority_case.asc(), ContentItem.priority.asc(), ContentItem.created_at.asc(), ContentItem.id.asc())
             .limit(50)
         )
         if include_generated:
@@ -545,15 +545,20 @@ class SchedulerService:
         if lock_for_update:
             stmt = stmt.with_for_update(skip_locked=True)
 
-        candidates = list(((await session.execute(stmt)).scalars().all()))
-
-        for candidate in candidates:
-            if not await self._passes_limits(session, channel, candidate, slot_dt):
-                continue
-            if await self._is_duplicate_for_channel(session, channel.id, candidate):
-                continue
-            return candidate
-        return None
+        offset = 0
+        while True:
+            candidates = list(((await session.execute(stmt.offset(offset))).scalars().all()))
+            for candidate in candidates:
+                if not await self._passes_limits(session, channel, candidate, slot_dt):
+                    continue
+                if await self._is_duplicate_for_channel(session, channel.id, candidate):
+                    continue
+                return candidate
+            if len(candidates) < 50:
+                return None
+            # Old approved duplicates must not hide eligible live posts on the
+            # following page and cause the slot to fall back to a paste.
+            offset += len(candidates)
 
     async def _pick_library_paste_candidate(
         self,

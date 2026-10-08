@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from math import floor
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.editorial.models.channel import Channel, ChannelSlot
 from src.editorial.models.content import ContentItem
 from src.editorial.models.enums import ContentItemStatus, ContentSourceType, PublicationStatus
 from src.editorial.models.publication import PublicationLog
+from src.editorial.models.submission import Submission
+from src.editorial.services.scheduler import SchedulerService
+from src.editorial.utils.media import build_media_fingerprint, is_media_submission
+from src.editorial.utils.text import similarity_score
 from src.editorial.config import settings
 
 
@@ -221,19 +226,59 @@ class AutoSlotPlannerService:
         day_start_utc: datetime,
         day_end_utc: datetime,
     ) -> int:
-        count = await session.scalar(
-            select(func.count())
-            .select_from(ContentItem)
-            .where(
-                ContentItem.channel_id == channel_id,
-                ContentItem.status == ContentItemStatus.APPROVED,
-                ContentItem.scheduled_for.is_(None),
-                ContentItem.source_type.in_([ContentSourceType.SUBMISSION, ContentSourceType.EDITORIAL]),
-                (ContentItem.publish_after.is_(None) | (ContentItem.publish_after < day_end_utc)),
-                (ContentItem.expires_at.is_(None) | (ContentItem.expires_at > day_start_utc)),
+        # Use the same publication-history checks as the scheduler. Skipped
+        # duplicates remain approved, so a raw COUNT repeatedly inflates the
+        # daily grid even though none of those items can fill its slots.
+        rows = (
+            await session.execute(
+                select(ContentItem, Submission)
+                .outerjoin(Submission, Submission.id == ContentItem.origin_submission_id)
+                .where(
+                    ContentItem.channel_id == channel_id,
+                    ContentItem.status == ContentItemStatus.APPROVED,
+                    ContentItem.scheduled_for.is_(None),
+                    ContentItem.source_type.in_([ContentSourceType.SUBMISSION, ContentSourceType.EDITORIAL]),
+                    (ContentItem.publish_after.is_(None) | (ContentItem.publish_after < day_end_utc)),
+                    (ContentItem.expires_at.is_(None) | (ContentItem.expires_at > day_start_utc)),
+                )
+                .order_by(
+                    case((ContentItem.source_type == ContentSourceType.SUBMISSION, 0), else_=1),
+                    ContentItem.priority.asc(), ContentItem.created_at.asc(), ContentItem.id.asc(),
+                )
             )
-        )
-        return int(count or 0)
+        ).all()
+        scheduler = SchedulerService()
+        text_hashes: set[str] = set()
+        text_bodies: set[str] = set()
+        recent_texts: deque[str] = deque(maxlen=25)
+        media_fingerprints: set[str] = set()
+        count = 0
+
+        for candidate, submission in rows:
+            if await scheduler._is_duplicate_for_channel(session, channel_id, candidate):
+                continue
+            if submission is not None and is_media_submission(submission):
+                _, fingerprint = build_media_fingerprint(submission)
+                if fingerprint in media_fingerprints:
+                    continue
+                media_fingerprints.add(fingerprint)
+            else:
+                if candidate.text_hash:
+                    if candidate.text_hash in text_hashes:
+                        continue
+                elif candidate.body_text in text_bodies:
+                    continue
+                if candidate.normalized_text and any(
+                    similarity_score(candidate.normalized_text, previous) >= settings.similarity_threshold
+                    for previous in recent_texts
+                ):
+                    continue
+                if candidate.text_hash:
+                    text_hashes.add(candidate.text_hash)
+                text_bodies.add(candidate.body_text)
+                recent_texts.append(candidate.normalized_text)
+            count += 1
+        return count
 
     @staticmethod
     def _calculate_target_slots(channel: Channel, approved_ready_count: int) -> tuple[int, int]:
