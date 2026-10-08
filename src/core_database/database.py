@@ -402,6 +402,84 @@ class CrudBannedUser:
             await conn.execute(stmt)
             await conn.commit()
 
+    # Telegram user IDs are positive and channel IDs are negative. The zero
+    # channel/bot pair represents a network-wide ban, including future bots.
+    GLOBAL_CHANNEL_ID = 0
+
+    @staticmethod
+    async def is_user_banned(id_user: int, id_channel: int) -> bool:
+        async with db_helper.engine.connect() as conn:
+            return await conn.scalar(
+                select(BannedUser.id).where(
+                    BannedUser.id_user == id_user,
+                    BannedUser.id_channel.in_([id_channel, CrudBannedUser.GLOBAL_CHANNEL_ID]),
+                ).limit(1)
+            ) is not None
+
+    @staticmethod
+    async def add_global_ban(id_user: int) -> bool:
+        async with db_helper.engine.connect() as conn:
+            dialect_insert = {"postgresql": pg_insert, "sqlite": sqlite_insert}[conn.dialect.name]
+            stmt = dialect_insert(BannedUser).values(id_user=id_user, id_channel=0, bot_id=0)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=[BannedUser.id_user, BannedUser.id_channel, BannedUser.bot_id],
+            ).returning(BannedUser.id)
+            created = (await conn.execute(stmt)).scalar_one_or_none() is not None
+            await conn.commit()
+            return created
+
+    @staticmethod
+    async def delete_all_user_bans(id_user: int) -> int:
+        async with db_helper.engine.connect() as conn:
+            rows = (await conn.execute(
+                delete(BannedUser).where(BannedUser.id_user == id_user).returning(BannedUser.id)
+            )).all()
+            await conn.commit()
+            return len(rows)
+
+    @staticmethod
+    def _latest_usernames():
+        return select(
+            SenderData.user_id, SenderData.username,
+            func.row_number().over(
+                partition_by=SenderData.user_id,
+                order_by=[SenderData.timestamp.desc(), SenderData.id.desc()],
+            ).label("position"),
+        ).subquery()
+
+    @staticmethod
+    async def get_last_username(id_user: int) -> str | None:
+        async with db_helper.engine.connect() as conn:
+            return await conn.scalar(
+                select(SenderData.username).where(SenderData.user_id == id_user)
+                .order_by(SenderData.timestamp.desc(), SenderData.id.desc()).limit(1)
+            )
+
+    @staticmethod
+    async def find_user_ids_by_username(username: str) -> list[int]:
+        latest = CrudBannedUser._latest_usernames()
+        async with db_helper.engine.connect() as conn:
+            return list((await conn.execute(select(latest.c.user_id).where(
+                latest.c.position == 1,
+                func.lower(func.ltrim(latest.c.username, "@")) == username.lower(),
+            ).order_by(latest.c.user_id))).scalars().all())
+
+    @staticmethod
+    async def list_banned_users_page(page: int = 0, page_size: int = 20):
+        async with db_helper.engine.connect() as conn:
+            total = int(await conn.scalar(select(func.count(func.distinct(BannedUser.id_user)))) or 0)
+            page = min(max(0, page), max(0, (total-1)//page_size))
+            latest_username = (
+                select(SenderData.username).where(SenderData.user_id == BannedUser.id_user)
+                .order_by(SenderData.timestamp.desc(), SenderData.id.desc()).limit(1).scalar_subquery()
+            )
+            rows = (await conn.execute(
+                select(BannedUser.id_user, latest_username.label("username"))
+                .group_by(BannedUser.id_user).order_by(BannedUser.id_user)
+                .offset(page*page_size).limit(page_size)
+            )).all()
+            return rows, total, page
+
 
 class CrudBotsData:
     @staticmethod

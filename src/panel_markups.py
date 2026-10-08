@@ -59,7 +59,32 @@ def build_extra_panel(is_general_admin: bool = False) -> InlineKeyboardMarkup:
         )
     markup.add(InlineKeyboardButton("SQL -> CSV", callback_data="panel:sql_export"))
     markup.add(InlineKeyboardButton("Настройка рекламы предложек", callback_data="panel:suggestion_ads"))
+    markup.add(InlineKeyboardButton("Баны", callback_data="panel:bans"))
     markup.add(InlineKeyboardButton("\u041d\u0430\u0437\u0430\u0434 \u0432 \u043f\u0430\u043d\u0435\u043b\u044c", callback_data="panel:main"))
+    return markup
+
+
+def build_bans_panel() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("Список забаненных пользователей", callback_data="panel:bans_list:0"),
+        InlineKeyboardButton("Забанить во всех предложках", callback_data="panel:ban_user"),
+        InlineKeyboardButton("Разбанить во всех предложках", callback_data="panel:unban_user"),
+        InlineKeyboardButton("Назад", callback_data="panel:extra"),
+    )
+    return markup
+
+
+def build_bans_list_actions(page: int, *, has_previous: bool, has_next: bool) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    if has_previous:
+        buttons.append(InlineKeyboardButton("⬅️", callback_data=f"panel:bans_list:{page-1}"))
+    if has_next:
+        buttons.append(InlineKeyboardButton("➡️", callback_data=f"panel:bans_list:{page+1}"))
+    if buttons:
+        markup.add(*buttons)
+    markup.add(InlineKeyboardButton("Назад", callback_data="panel:bans"))
     return markup
 
 

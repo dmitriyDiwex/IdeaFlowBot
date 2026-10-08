@@ -83,8 +83,7 @@ class Utils:
         return json.dumps(payload, ensure_ascii=False)
 
     async def check_banned_user(self, id_user: int, id_channel: int) -> bool:
-        all_info = await self.db_banned.get_banned_users(id_user=id_user, id_channel=id_channel)
-        return bool(all_info)
+        return await self.db_banned.is_user_banned(id_user=id_user, id_channel=id_channel)
 
     @staticmethod
     async def get_timestamp_public(time) -> float:

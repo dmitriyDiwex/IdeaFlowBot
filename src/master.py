@@ -33,6 +33,7 @@ from src.editorial.services.statistics_export import (
     validate_statistics_delta_days,
 )
 from src.editorial.services.telegram_actions import TelegramEditorialActions
+from src.editorial.services.user_bans import UserBanService
 from src.editorial.services.suggestion_ad_service import suggestion_ad_html, suggestion_confirmation_html
 from src.confession_publisher import ConfessionPublisherRuntime
 from src.telegram_runtime import calculate_telegram_request_limit
@@ -56,6 +57,8 @@ from src.panel_markups import (
     build_empty_paste_actions,
     build_empty_confession_paste_actions,
     build_extra_panel,
+    build_bans_panel,
+    build_bans_list_actions,
     build_global_paste_tag_rule_actions,
     build_main_panel,
     build_my_channels_actions,
@@ -106,6 +109,7 @@ class MasterBot:
         self.db_export_service = DatabaseExportService()
         self.sql_export_service = SqlExportService()
         self.legacy_reader = LegacyCollectorReader()
+        self.user_ban_service = UserBanService()
 
         self.commands = [
             BotCommand("panel", "открыть панель управления"),
@@ -353,6 +357,7 @@ class MasterBot:
                 export_path.unlink(missing_ok=True)
 
     async def _show_extra_panel(self, chat_id: int) -> None:
+        self._clear_user_state(chat_id)
         is_general_admin = self._is_general_admin(chat_id)
         await self.main_bot.send_message(
             chat_id=chat_id,
@@ -377,6 +382,72 @@ class MasterBot:
             ),
             reply_markup=build_extra_panel(is_general_admin=is_general_admin),
         )
+
+    async def _show_bans_panel(self, chat_id: int) -> None:
+        self._clear_user_state(chat_id)
+        await self.main_bot.send_message(
+            chat_id, "Баны.\n\nЗдесь можно посмотреть забаненных пользователей, "
+            "забанить или разбанить пользователя во всех ботах предложек.\n"
+            "Список включает общие баны и баны отдельных предложек.",
+            reply_markup=build_bans_panel(),
+        )
+
+    async def _show_banned_users(self, chat_id: int, page: int = 0) -> None:
+        self._clear_user_state(chat_id)
+        page_size = 20
+        users, total, page = await self.user_ban_service.list_users(page, page_size)
+        if not users:
+            text = "Забаненных пользователей нет."
+        else:
+            lines = [f"{page*page_size+index}. {user.label}" for index, user in enumerate(users, start=1)]
+            text = f"Забаненные пользователи — всего {total}.\nСтраница {page+1}.\n\n" + "\n".join(lines)
+        await self._send_panel_text(chat_id, text, reply_markup=build_bans_list_actions(
+            page, has_previous=page > 0, has_next=(page+1)*page_size < total,
+        ))
+
+    async def _handle_bans_callback(self, action: str, chat_id: int, page: int = 0) -> None:
+        if action == "bans":
+            await self._show_bans_panel(chat_id)
+        elif action == "bans_list":
+            await self._show_banned_users(chat_id, page)
+        else:
+            ban = action == "ban_user"
+            self._set_user_state(chat_id, "await_ban_user" if ban else "await_unban_user")
+            await self.main_bot.send_message(
+                chat_id, "Введите @username или Telegram ID пользователя, чтобы "
+                + ("забанить" if ban else "разбанить") + " его во всех предложках.\n"
+                "Если username ещё неизвестен боту, используйте ID. Для отмены напишите «отмена».",
+                reply_markup=build_bans_panel(),
+            )
+
+    async def _handle_ban_user_text(self, message: Message, action: str, text_value: str) -> bool:
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        if not self._is_admin(user_id):
+            await self.main_bot.send_message(message.chat.id, "Доступно только администраторам.")
+            return True
+        if text_value.casefold() in {"отмена", "/cancel"}:
+            await self._show_bans_panel(message.chat.id)
+            return True
+        try:
+            if not message.text:
+                raise ValueError("Отправьте username или Telegram ID текстовым сообщением.")
+            target = await self.user_ban_service.resolve_user(text_value)
+            if action == "await_ban_user":
+                created = await self.user_ban_service.ban(target.user_id)
+                result = "забанен во всех предложках" if created else "уже забанен во всех предложках"
+            else:
+                removed = await self.user_ban_service.unban(target.user_id)
+                result = "разбанен во всех предложках" if removed else "не забанен"
+            await self.main_bot.send_message(message.chat.id, f"{target.label} — {result}.")
+            await self._show_bans_panel(message.chat.id)
+        except ValueError as exc:
+            self._set_user_state(message.chat.id, action)
+            await self.main_bot.send_message(message.chat.id, f"{exc}\nОтправьте username или ID ещё раз.", reply_markup=build_bans_panel())
+        except Exception:
+            logger.exception("Failed to update user ban")
+            self._set_user_state(message.chat.id, action)
+            await self.main_bot.send_message(message.chat.id, "Не удалось изменить бан. Попробуйте ещё раз.", reply_markup=build_bans_panel())
+        return True
 
     async def _show_suggestion_ads_panel(self, chat_id: int) -> None:
         self._clear_user_state(chat_id)
@@ -2632,6 +2703,9 @@ class MasterBot:
             self._clear_user_state(message.chat.id)
         text_value = (message.text or message.caption or "").strip()
 
+        if action in {"await_ban_user", "await_unban_user"}:
+            return await self._handle_ban_user_text(message, action, text_value)
+
         if action in {
             "await_suggestion_ad_text",
             "await_add_suggestion_ad_exclusion",
@@ -3674,6 +3748,7 @@ class MasterBot:
                 answered_early = False
                 match action:
                     case "main":
+                        self._clear_user_state(call.message.chat.id)
                         await self._safe_answer_callback(self.main_bot, call.id)
                         answered_early = True
                         await self._answer_panel(call.message.chat.id)
@@ -3795,6 +3870,10 @@ class MasterBot:
                             call.message.chat.id,
                             "Отправьте ссылку, которую нужно удалить из списка исключений.",
                         )
+                    case "bans" | "bans_list" | "ban_user" | "unban_user":
+                        await self._safe_answer_callback(self.main_bot, call.id)
+                        answered_early = True
+                        await self._handle_bans_callback(action, call.message.chat.id, page)
                     case "extra":
                         await self._safe_answer_callback(self.main_bot, call.id)
                         answered_early = True
