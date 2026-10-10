@@ -80,6 +80,8 @@ class Settings:
         "Спасибо за сообщение. Если модератор его одобрит, мы опубликуем его позже.",
     )
     logging_path: str = os.getenv("LOGGING_PATH", "logs/bot.log")
+    statistics_google_spreadsheet_id: str = os.getenv("STATISTICS_GOOGLE_SPREADSHEET_ID", "").strip()
+    statistics_google_credentials_file: str = os.getenv("STATISTICS_GOOGLE_CREDENTIALS_FILE", "").strip()
     const_time_sleep: float = float(os.getenv("CONST_TIME_SLEEP", "30"))
     proxy_user: str = os.getenv("PROXY_USER", "")
     proxy_password: str = os.getenv("PROXY_PASSWORD", "")

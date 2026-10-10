@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 
+from config import settings as collector_settings
+
 from sqlalchemy import delete as sql_delete, func, or_, select, update as sql_update
 from telebot.async_telebot import AsyncTeleBot
 
@@ -38,6 +40,10 @@ from src.editorial.services.channel_history_service import ChannelHistoryImportR
 from src.editorial.services.channel_service import ChannelService
 from src.editorial.services.confession_service import ConfessionService
 from src.editorial.services.generation.service import GenerationService
+from src.editorial.services.google_statistics_export import (
+    GoogleStatisticsExportResult,
+    GoogleStatisticsExportService,
+)
 from src.editorial.services.import_legacy import LegacyImporter
 from src.editorial.services.legacy_moderation_sync import LegacyModerationSyncService
 from src.editorial.services.legacy_source import LegacyCollectorReader
@@ -49,7 +55,7 @@ from src.editorial.services.moderation_case_service import (
 from src.editorial.services.paste_service import PasteService
 from src.editorial.services.publisher import PublisherService
 from src.editorial.services.scheduler import SchedulerService
-from src.editorial.services.statistics_export import StatisticsExportService
+from src.editorial.services.statistics_export import DEFAULT_STATISTICS_DELTA_DAYS, StatisticsExportService
 from src.editorial.services.tag_service import PasteTagSummary, TagService
 from src.editorial.services.telegram_resilience import is_transient_telegram_error
 from src.editorial.services.suggestion_ad_service import SuggestionAdService
@@ -138,6 +144,10 @@ class TelegramEditorialActions:
         self.scheduler = SchedulerService()
         self.publisher = PublisherService()
         self.statistics_export_service = StatisticsExportService()
+        self.google_statistics_export_service = GoogleStatisticsExportService(
+            spreadsheet_id=collector_settings.statistics_google_spreadsheet_id,
+            credentials_file=collector_settings.statistics_google_credentials_file,
+        )
         self.admin_statistics_export_service = AdminStatisticsExportService()
         self.banned_users = CrudBannedUser()
         self._legacy_bot_id_cache: dict[str, int] = {}
@@ -1837,6 +1847,24 @@ class TelegramEditorialActions:
                 channel_tags=channel_tags,
                 delta_days=delta_days,
             )
+
+    async def export_channel_statistics_to_google_sheets(
+        self,
+        *,
+        channel_titles: dict[int, str | None] | None = None,
+        channel_tags: dict[int, str | None] | None = None,
+        now: datetime | None = None,
+    ) -> GoogleStatisticsExportResult:
+        now = now or datetime.now(timezone.utc)
+        async with session_factory() as session:
+            rows = await self.statistics_export_service._build_rows(
+                session,
+                channel_titles=channel_titles or {},
+                channel_tags=channel_tags or {},
+                delta_days=DEFAULT_STATISTICS_DELTA_DAYS,
+                now=now,
+            )
+        return await self.google_statistics_export_service.export_rows(rows, now=now)
 
     async def export_admin_statistics(
         self,

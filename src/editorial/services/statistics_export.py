@@ -205,6 +205,22 @@ class StatisticsExportService:
         *,
         delta_days: int = DEFAULT_STATISTICS_DELTA_DAYS,
     ) -> None:
+        sheet_rows = self.build_sheet_rows(rows, delta_days=delta_days)
+
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", self._content_types_xml())
+            archive.writestr("_rels/.rels", self._root_rels_xml())
+            archive.writestr("xl/workbook.xml", self._workbook_xml())
+            archive.writestr("xl/_rels/workbook.xml.rels", self._workbook_rels_xml())
+            archive.writestr("xl/styles.xml", self._styles_xml())
+            archive.writestr("xl/worksheets/sheet1.xml", self._sheet_xml(sheet_rows))
+
+    @staticmethod
+    def build_sheet_rows(
+        rows: list[ChannelStatisticsRow],
+        *,
+        delta_days: int = DEFAULT_STATISTICS_DELTA_DAYS,
+    ) -> list[list[str | int | None]]:
         delta_days = validate_statistics_delta_days(delta_days)
         sorted_rows = sorted(
             rows,
@@ -230,13 +246,7 @@ class StatisticsExportService:
             for row in sorted_rows
         )
 
-        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
-            archive.writestr("[Content_Types].xml", self._content_types_xml())
-            archive.writestr("_rels/.rels", self._root_rels_xml())
-            archive.writestr("xl/workbook.xml", self._workbook_xml())
-            archive.writestr("xl/_rels/workbook.xml.rels", self._workbook_rels_xml())
-            archive.writestr("xl/styles.xml", self._styles_xml())
-            archive.writestr("xl/worksheets/sheet1.xml", self._sheet_xml(sheet_rows))
+        return sheet_rows
 
     @staticmethod
     def _cell_ref(row_index: int, col_index: int) -> str:

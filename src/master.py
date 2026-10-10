@@ -106,6 +106,10 @@ class MasterBot:
         self.delayed_database = CrudDelayedPosts()
         self.bot_admins_database = CrudBotAdmins()
         self.editorial_actions = TelegramEditorialActions()
+        if settings.statistics_google_spreadsheet_id and not settings.statistics_google_credentials_file:
+            logger.warning(
+                "Daily Google statistics export is disabled: set STATISTICS_GOOGLE_CREDENTIALS_FILE"
+            )
         self.db_export_service = DatabaseExportService()
         self.sql_export_service = SqlExportService()
         self.legacy_reader = LegacyCollectorReader()
@@ -3612,17 +3616,44 @@ class MasterBot:
             await asyncio.sleep(max((next_run - now_msk).total_seconds(), 1))
 
             try:
-                result = await self.editorial_actions.record_daily_subscriber_snapshots()
-                logger.info(
-                    "Daily subscriber snapshots finished: checked={}, updated={}, recorded={}, deleted={}, failed={}",
-                    result.channels_checked,
-                    result.subscriber_counts_updated,
-                    result.snapshots_recorded,
-                    result.snapshots_deleted,
-                    result.failed,
-                )
+                await self._run_daily_statistics_update()
             except Exception as ex:
                 logger.exception("Failed to record daily subscriber snapshots: {}", ex)
+
+    async def _run_daily_statistics_update(self) -> None:
+        result = await self.editorial_actions.record_daily_subscriber_snapshots()
+        logger.info(
+            "Daily subscriber snapshots finished: checked={}, updated={}, recorded={}, deleted={}, failed={}",
+            result.channels_checked,
+            result.subscriber_counts_updated,
+            result.snapshots_recorded,
+            result.snapshots_deleted,
+            result.failed,
+        )
+
+        if not self.editorial_actions.google_statistics_export_service.enabled:
+            return
+        try:
+            channels = await self.editorial_actions.list_channels()
+            channel_titles = {
+                channel.id: self._channel_title_from_runtime(channel.tg_channel_id) or channel.title
+                for channel in channels
+            }
+            channel_tags = {
+                channel.id: self._channel_label_from_runtime(channel.tg_channel_id) or channel.short_code
+                for channel in channels
+            }
+            exported = await self.editorial_actions.export_channel_statistics_to_google_sheets(
+                channel_titles=channel_titles,
+                channel_tags=channel_tags,
+            )
+            logger.info(
+                "Daily Google statistics export finished: sheet={}, deleted={}",
+                exported.sheet_title,
+                exported.sheets_deleted,
+            )
+        except Exception:
+            logger.exception("Failed to export daily channel statistics to Google Sheets")
 
     @logger.catch
     async def callback_adv_send_message(self, call: CallbackQuery, channel_username: str, info_sender: User) -> None:

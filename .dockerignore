@@ -1,5 +1,6 @@
 .git
 .env
+google-service-account*.json
 .venv/
 __pycache__/
 .pytest_cache/
@@ -8,3 +9,6 @@ data/
 logs/
 *.db
 *.sql
+
+# Deployment credential transfer bundle stays outside application images
+deploy/

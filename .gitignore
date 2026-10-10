@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+google-service-account*.json
 .venv/
 logs/
 data/bot_network_db.db
@@ -9,3 +10,7 @@ data/bot_network_db.db
 /ideaflow_editorial.sql
 log_data.log
 
+
+# Local credentials and restored Google service account keys
+/data/*.json
+/data/.google-service-account.*
