@@ -14,6 +14,7 @@ from src.editorial.config import settings
 from src.editorial.models.enums import SubmissionStatus
 from src.editorial.services.mcp_moderation import ModerationRequest
 from src.editorial.services.moderation_batch import ModerationBatchService
+from src.editorial.services.mcp_panel_resync import McpPanelResyncService
 from src.editorial.services.moderation_playbook import playbook, PLAYBOOK_URI
 
 
@@ -28,6 +29,10 @@ SERVER_INSTRUCTIONS = """
 Старый API: list_pending_submissions, dry-run apply_moderation_batch, затем после подтверждения
 применение с отдельным batch_id и verify_moderation_batch. advertising использует только
 настроенный ответ менеджера. Нет немедленной публикации, бана, произвольного ответа, SQL или Telegram API.
+Для warning/pending/зависших dispatching используйте resync_moderation_panels по operation_id
+из verify_moderation_batch: сначала dry_run, затем после подтверждения dry_run=false,
+user_confirmed=true. Это только карточки, без повторной модерации и рекламного ответа.
+При state=applying повторите тот же batch_id после retry_after_seconds.
 """.strip()
 
 
@@ -66,6 +71,7 @@ WRITE = ToolAnnotations(
 
 
 service = ModerationBatchService()
+panel_sync_service = McpPanelResyncService(service)
 mcp = FastMCP(
     name="IdeaFlow Moderation",
     instructions=SERVER_INSTRUCTIONS,
@@ -289,6 +295,33 @@ async def apply_moderation_batch(
 )
 async def verify_moderation_batch(batch_id: str) -> dict[str, object]:
     return await service.verify_batch(batch_id)
+
+
+@mcp.tool(annotations=WRITE, structured_output=True)
+async def resync_moderation_panels(
+    batch_id: str, operation_ids: list[int],
+    dry_run: bool = True, user_confirmed: bool = False,
+) -> dict[str, object]:
+    """Retry ONLY processed Telegram cards for 1..100 applied MCP operation IDs.
+
+    No decisions, publications or advertising replies are repeated. Human changes are protected.
+    A completed retry is idempotent; retry warnings with a NEW batch_id after fixing the cause.
+    Deferred items resume with the SAME batch_id after retry_after_seconds (20/channel/60s).
+    """
+    return await panel_sync_service.resync_batch(
+        batch_id=batch_id, operation_ids=operation_ids,
+        dry_run=dry_run, user_confirmed=user_confirmed,
+    )
+
+
+@mcp.tool(annotations=READ_ONLY, structured_output=True)
+async def verify_moderation_panel_sync(batch_id: str) -> dict[str, object]:
+    """Read the durable card-only retry audit. Does not contact Telegram or change anything.
+
+    verified means Telegram accepted the checked card edit; it does not verify advertising delivery.
+    Also call verify_moderation_batch on the ORIGINAL batch to check current submission statuses.
+    """
+    return await panel_sync_service.verify_batch(batch_id)
 
 
 class BearerTokenMiddleware:

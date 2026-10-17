@@ -19,7 +19,7 @@ from src.editorial.db.session import session_factory
 from src.editorial.models.channel import Channel
 from src.editorial.models.content import ContentItem
 from src.editorial.models.enums import ContentItemStatus, ReviewDecision, SubmissionStatus
-from src.editorial.models.mcp_moderation import McpModerationAction
+from src.editorial.models.mcp_moderation import McpModerationAction, McpPanelSyncAttempt
 from src.editorial.models.moderation_case import ModerationCase, ModerationCaseEvent
 from src.editorial.services.moderation_playbook import playbook
 from src.editorial.models.submission import Submission
@@ -647,6 +647,8 @@ class McpModerationService:
             if operation.telegram_sync_state != "pending":
                 return self._operation_payload(operation, replayed=True)
             operation.telegram_sync_state = "dispatching"
+            # A resumed pending dispatch starts now, not at the old DB decision time.
+            operation.rate_limit_at = await self._now(session)
             await session.commit()
             submission_id = operation.submission_id
         warning = None
@@ -672,7 +674,12 @@ class McpModerationService:
             warning = f"Moderation was applied, but Telegram synchronization failed: {exc}"
 
         async with self.session_maker() as session:
-            operation = await session.get(McpModerationAction, operation_id)
+            operation = await session.scalar(
+                select(McpModerationAction).where(McpModerationAction.id == operation_id).with_for_update()
+            )
+            # A card-only recovery may have taken over an expired dispatch.
+            if operation.telegram_sync_state != "dispatching":
+                return self._operation_payload(operation, replayed=True)
             operation.legacy_sync_count = sync_count
             operation.warning_text = self._truncate(warning, 4000) if warning else None
             operation.telegram_sync_state = "warning" if warning else "verified"
@@ -748,15 +755,30 @@ class McpModerationService:
             or_(self._human_history_filter(), self._human_review_filter()),
         ).limit(1)))
 
-    async def _rate_retry_after(self, session, channel_id: int) -> int:
+    async def _rate_retry_after(
+        self, session, channel_id: int, *,
+        recovering_operation_id: int | None = None, recovering_attempt_id: int | None = None,
+    ) -> int:
         now = await self._now(session)
+        in_flight = McpModerationAction.telegram_sync_state.in_(["pending", "dispatching"])
+        if recovering_operation_id is not None:
+            # Replace only this old unresolved reservation. Its recent timestamp,
+            # if any, still counts as a separate potential Telegram operation.
+            in_flight = and_(in_flight, McpModerationAction.id != recovering_operation_id)
         times = list((await session.execute(select(McpModerationAction.rate_limit_at).where(
             McpModerationAction.channel_id == channel_id,
             McpModerationAction.dry_run.is_(False),
             McpModerationAction.outcome == "applied",
             or_(McpModerationAction.rate_limit_at > now - timedelta(seconds=60),
-                McpModerationAction.telegram_sync_state.in_(["pending", "dispatching"])),
+                in_flight),
         ).order_by(McpModerationAction.rate_limit_at))).scalars())
+        times.extend((await session.scalars(select(McpPanelSyncAttempt.rate_limit_at).where(
+            McpPanelSyncAttempt.channel_id == channel_id,
+            McpPanelSyncAttempt.id != recovering_attempt_id if recovering_attempt_id is not None else True,
+            or_(McpPanelSyncAttempt.rate_limit_at > now - timedelta(seconds=60),
+                McpPanelSyncAttempt.state == "processing"),
+        ))).all())
+        times = sorted(self._utc(value) for value in times if value is not None)
         if len(times) < 20:
             return 0
         # Unknown in-flight external effects conservatively occupy capacity.

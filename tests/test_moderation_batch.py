@@ -20,10 +20,11 @@ from src.editorial.mcp.server import mcp, SERVER_INSTRUCTIONS
 from src.editorial.models.channel import Channel
 from src.editorial.models.content import ContentItem
 from src.editorial.models.enums import SubmissionStatus
-from src.editorial.models.mcp_moderation import McpModerationAction, McpModerationSnapshot
+from src.editorial.models.mcp_moderation import McpModerationAction, McpModerationSnapshot, McpPanelSyncAttempt
 from src.editorial.models.moderation_case import ModerationCase, ModerationCaseEvent
 from src.editorial.models.submission import Submission
 from src.editorial.services.mcp_moderation import McpModerationService, ModerationRequest
+from src.editorial.services.mcp_panel_resync import McpPanelResyncService
 from src.editorial.services.moderation_batch import ModerationBatchService, REASON_CODES
 from src.editorial.services.moderation_playbook import ModerationPlaybook, PLAYBOOK_PATH, PLAYBOOK_URI, playbook
 from src.editorial.utils.text import compute_moderation_hash, compute_text_hash
@@ -149,6 +150,11 @@ async def test_mcp_catalog_preserves_old_api_and_readonly_resources():
     assert tools["commit_moderation_batch"].annotations.destructiveHint
     assert not tools["prepare_moderation_batch"].annotations.readOnlyHint
     assert tools["commit_moderation_batch"].inputSchema["properties"]["user_confirmed"]["default"] is False
+    repair = tools["resync_moderation_panels"]
+    assert repair.annotations.destructiveHint and repair.annotations.idempotentHint
+    assert repair.inputSchema["properties"]["dry_run"]["default"] is True
+    assert repair.inputSchema["properties"]["user_confirmed"]["default"] is False
+    assert tools["verify_moderation_panel_sync"].annotations.readOnlyHint
 
 
 @pytest.mark.asyncio
@@ -729,3 +735,330 @@ async def test_human_hold_retaining_mcp_note_is_protected_but_agent_hold_can_be_
         dry_run=False,
     )
     assert legacy["outcomes"] == {"skipped": 1}
+
+
+async def failed_panel_operations(env, values):
+    await seed(env, [{} for _ in values])
+    snapshot = await env.service.prepare_moderation_batch(limit=len(values))
+    decisions = [decision(i, value, "advertising" if value == "advertising" else "ok")
+                 for i, value in enumerate(values, 1)]
+    env.checked.side_effect = TimeoutError("synthetic Telegram timeout")
+    result = await commit(env, snapshot, decisions)
+    while result["pending"]:
+        env.now[0] += timedelta(seconds=60)
+        result = await commit(env, snapshot, decisions)
+    env.checked.side_effect = None
+    env.checked.reset_mock()
+    env.now[0] += timedelta(seconds=601)
+    async with env.factory() as session:
+        return list(await session.scalars(select(McpModerationAction.id).order_by(McpModerationAction.id)))
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_dry_run_confirmation_validation_and_no_writes(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    repair = McpPanelResyncService(batch_env.service)
+    preview = await repair.resync_batch(batch_id="repair", operation_ids=ids)
+    assert preview["outcomes"] == {"eligible": 1}
+    batch_env.checked.assert_not_awaited()
+    async with batch_env.factory() as session:
+        assert await session.scalar(select(func.count()).select_from(McpPanelSyncAttempt)) == 0
+        assert (await session.get(McpModerationAction, ids[0])).telegram_sync_state == "warning"
+    with pytest.raises(ValueError, match="user_confirmed"):
+        await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False)
+    batch_env.service.write_enabled = False
+    with pytest.raises(ValueError, match="writes enabled"):
+        await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    for invalid in [[], [0], [True], ids * 2, list(range(1, 102))]:
+        with pytest.raises(ValueError, match="operation_ids"):
+            await repair.resync_batch(batch_id="repair", operation_ids=invalid)
+    with pytest.raises(ValueError, match="batch_id"):
+        await repair.resync_batch(batch_id="bad/id", operation_ids=ids)
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_only_cards_idempotent_reordered_subset_and_audit(batch_env):
+    ids = await failed_panel_operations(batch_env, ["approve", "reject", "advertising", "hold"])
+    repair = McpPanelResyncService(batch_env.service)
+    async with batch_env.factory() as session:
+        before = [(item.status, item.reviewed_at, item.moderator_note)
+                  for item in await session.scalars(select(Submission).order_by(Submission.id))]
+        content_count = await session.scalar(select(func.count()).select_from(ContentItem))
+        action_count = await session.scalar(select(func.count()).select_from(McpModerationAction))
+    result = await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert result["outcomes"] == {"verified": 3, "skipped": 1}
+    assert result["advertising_reply_retried"] is False
+    batch_env.advertising.assert_awaited_once()
+    assert batch_env.checked.await_count == 3
+    for selection in [list(reversed(ids)), ids[1:2]]:
+        await repair.resync_batch(batch_id="repair", operation_ids=selection, dry_run=False, user_confirmed=True)
+    assert batch_env.checked.await_count == 3
+    restarted = McpPanelResyncService(ModerationBatchService(
+        session_maker=batch_env.factory, write_enabled=True, clock=lambda: batch_env.now[0],
+    ))
+    assert (await restarted.verify_batch("repair"))["outcomes"] == {"verified": 3}
+    async with batch_env.factory() as session:
+        assert before == [(item.status, item.reviewed_at, item.moderator_note)
+                          for item in await session.scalars(select(Submission).order_by(Submission.id))]
+        assert await session.scalar(select(func.count()).select_from(ContentItem)) == content_count
+        assert await session.scalar(select(func.count()).select_from(McpModerationAction)) == action_count
+        # Do not erase an earlier advertising delivery warning on a card-only success.
+        assert (await session.get(McpModerationAction, ids[2])).warning_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["status", "human_same_status", "newer_decision", "hidden"])
+async def test_panel_resync_protects_changed_or_human_decisions(batch_env, change):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    async with batch_env.factory() as session:
+        item = await session.get(Submission, 1)
+        operation = await session.get(McpModerationAction, ids[0])
+        if change == "status":
+            item.status = SubmissionStatus.NEW
+        elif change == "human_same_status":
+            item.reviewed_at = batch_env.service._utc(operation.completed_at) + timedelta(seconds=1)
+        elif change == "hidden":
+            item.source_chat_id = -123
+        else:
+            session.add(McpModerationAction(
+                request_id="newer:1", batch_id="newer", requested_submission_id=1,
+                submission_id=1, channel_id=1, actor_id=0, decision="reject", reason="new decision",
+                dry_run=False, expected_status="new", resulting_status="rejected", outcome="applied",
+                created_at=batch_env.now[0], completed_at=batch_env.now[0], telegram_sync_state="warning",
+            ))
+        await session.commit()
+    repair = McpPanelResyncService(batch_env.service)
+    assert (await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False,
+                                    user_confirmed=True))["outcomes"] == {"skipped": 1}
+    batch_env.checked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_fresh_dispatch_defers_but_stale_dispatch_recovers_without_ad_send(batch_env):
+    ids = await failed_panel_operations(batch_env, ["advertising"])
+    async with batch_env.factory() as session:
+        operation = await session.get(McpModerationAction, ids[0])
+        operation.telegram_sync_state = "dispatching"
+        operation.rate_limit_at = batch_env.now[0]
+        await session.commit()
+    repair = McpPanelResyncService(batch_env.service)
+    first = await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert first["outcomes"] == {"deferred": 1} and first["retry_after_seconds"] == 600
+    batch_env.now[0] += timedelta(seconds=600)
+    result = await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert result["outcomes"] == {"verified": 1}
+    batch_env.advertising.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_timeout_retry_requires_new_batch_and_cancellation_lease_recovers(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    repair = McpPanelResyncService(batch_env.service)
+    repair.CARD_TIMEOUT_SECONDS = 0.01
+
+    async def hung(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    batch_env.checked.side_effect = hung
+    first = await repair.resync_batch(batch_id="timeout", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert first["outcomes"] == {"warning": 1}
+    assert "TimeoutError" in first["results"][0]["detail"]
+    batch_env.checked.side_effect = None
+    await repair.resync_batch(batch_id="timeout", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert batch_env.checked.await_count == 1
+    batch_env.checked.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await repair.resync_batch(batch_id="cancelled", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert (await repair.verify_batch("cancelled"))["outcomes"] == {"processing": 1}
+    batch_env.checked.side_effect = None
+    waiting = await repair.resync_batch(batch_id="cancelled", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert waiting["outcomes"] == {"deferred": 1}
+    batch_env.now[0] += timedelta(seconds=61)
+    resumed = await repair.resync_batch(batch_id="cancelled", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert resumed["outcomes"] == {"verified": 1}
+    assert batch_env.checked.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_shared_sliding_limit_and_other_channel_not_blocked(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"] * 21)
+    repair = McpPanelResyncService(batch_env.service)
+    first = await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert first["outcomes"] == {"verified": 20, "deferred": 1}
+    async with batch_env.factory() as session:
+        session.add_all([Submission(id=i, channel_id=channel, raw_text="Новый вопрос", cleaned_text="Новый вопрос",
+                                    text_hash=compute_text_hash("Новый вопрос"), created_at=batch_env.now[0])
+                         for i, channel in [(22, 1), (23, 2)]])
+        await session.commit()
+    applied = await batch_env.service.apply_batch(
+        batch_id="normal", dry_run=False, actions=[
+            ModerationRequest(i, "reject", "Опрос", SubmissionStatus.NEW) for i in [22, 23]
+        ],
+    )
+    assert applied["outcomes"] == {"deferred": 1, "applied": 1}
+    batch_env.now[0] += timedelta(seconds=59, milliseconds=900)
+    early = await repair.resync_batch(batch_id="repair", operation_ids=ids[-1:], dry_run=False, user_confirmed=True)
+    assert early["outcomes"] == {"deferred": 1} and early["retry_after_seconds"] == 1
+    batch_env.now[0] += timedelta(milliseconds=100)
+    final = await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert final["outcomes"] == {"verified": 21}
+    assert batch_env.checked.await_count == 22
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_concurrent_batches_edit_once(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    other = ModerationBatchService(session_maker=async_sessionmaker(batch_env.engine, expire_on_commit=False),
+                                   write_enabled=True, clock=lambda: batch_env.now[0])
+    results = await asyncio.gather(*[
+        McpPanelResyncService(owner).resync_batch(
+            batch_id=f"repair-{index}", operation_ids=ids, dry_run=False, user_confirmed=True,
+        ) for index, owner in enumerate([batch_env.service, other])
+    ])
+    assert sum(result["outcomes"].get("verified", 0) for result in results) == 1
+    batch_env.checked.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_budget_returns_resumable_items(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    repair = McpPanelResyncService(batch_env.service)
+    repair.CALL_BUDGET_SECONDS = 0
+    result = await repair.resync_batch(batch_id="repair", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert result["state"] == "applying" and result["outcomes"] == {"deferred": 1}
+    batch_env.checked.assert_not_awaited()
+
+
+def test_panel_resync_migration_offline_upgrade_and_downgrade():
+    from alembic import command
+    from alembic.config import Config
+    from io import StringIO
+
+    output = StringIO()
+    config = Config("alembic.ini", output_buffer=output)
+    command.upgrade(config, "20261003_28:20261017_29", sql=True)
+    sql = output.getvalue()
+    assert "CREATE TABLE mcp_panel_sync_attempts" in sql
+    assert "ix_mcp_panel_sync_channel_window" in sql
+    assert "UPDATE submissions" not in sql
+    output.seek(0)
+    output.truncate(0)
+    command.downgrade(config, "20261017_29:20261003_28", sql=True)
+    assert "DROP TABLE mcp_panel_sync_attempts" in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_zero_cards_is_not_verified_and_missing_id_skipped(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    batch_env.checked.return_value = 0
+    result = await McpPanelResyncService(batch_env.service).resync_batch(
+        batch_id="no-cards", operation_ids=ids + [999999], dry_run=False, user_confirmed=True,
+    )
+    assert result["outcomes"] == {"warning": 1, "skipped": 1}
+    assert "No Telegram moderation cards" in result["results"][0]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_twenty_stale_dispatches_can_recover_without_limiter_deadlock(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"] * 20)
+    async with batch_env.factory() as session:
+        for item in await session.scalars(select(McpModerationAction)):
+            item.telegram_sync_state = "dispatching"
+        await session.commit()
+    result = await McpPanelResyncService(batch_env.service).resync_batch(
+        batch_id="stale-dispatches", operation_ids=ids, dry_run=False, user_confirmed=True,
+    )
+    assert result["outcomes"] == {"verified": 20}
+    assert batch_env.checked.await_count == 20
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_human_change_between_claim_and_edit_is_rechecked(batch_env, monkeypatch):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    repair = McpPanelResyncService(batch_env.service)
+    original_sync = repair._sync_claim
+
+    async def intervene(*args):
+        async with batch_env.factory() as session:
+            (await session.get(Submission, 1)).status = SubmissionStatus.HOLD
+            await session.commit()
+        return await original_sync(*args)
+
+    monkeypatch.setattr(repair, "_sync_claim", intervene)
+    result = await repair.resync_batch(batch_id="intervention", operation_ids=ids,
+                                     dry_run=False, user_confirmed=True)
+    assert result["outcomes"] == {"skipped": 1}
+    batch_env.checked.assert_not_awaited()
+    async with batch_env.factory() as session:
+        assert (await session.get(Submission, 1)).status == SubmissionStatus.HOLD
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_stale_claim_superseded_and_late_worker_fenced(batch_env, monkeypatch):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    repair = McpPanelResyncService(batch_env.service)
+    original_sync = repair._sync_claim
+    monkeypatch.setattr(repair, "_sync_claim", AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await repair.resync_batch(batch_id="crashed", operation_ids=ids, dry_run=False, user_confirmed=True)
+    async with batch_env.factory() as session:
+        attempt = await session.scalar(select(McpPanelSyncAttempt))
+        old_id, old_token = attempt.id, attempt.claim_token
+    batch_env.now[0] += timedelta(seconds=61)
+    monkeypatch.setattr(repair, "_sync_claim", original_sync)
+    result = await repair.resync_batch(batch_id="takeover", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert result["outcomes"] == {"verified": 1}
+    late = await original_sync(old_id, old_token, ids[0], 1)
+    assert late["state"] == "warning" and late["idempotent_replay"]
+    batch_env.checked.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_panel_resync_stale_human_conflict_releases_cancelled_reservation(batch_env, monkeypatch):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    repair = McpPanelResyncService(batch_env.service)
+    monkeypatch.setattr(repair, "_sync_claim", AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await repair.resync_batch(batch_id="crashed", operation_ids=ids, dry_run=False, user_confirmed=True)
+    async with batch_env.factory() as session:
+        (await session.get(Submission, 1)).status = SubmissionStatus.HOLD
+        await session.commit()
+    batch_env.now[0] += timedelta(seconds=61)
+    result = await repair.resync_batch(batch_id="crashed", operation_ids=ids, dry_run=False, user_confirmed=True)
+    assert result["outcomes"] == {"skipped": 1}
+    assert (await repair.verify_batch("crashed"))["outcomes"] == {"skipped": 1}
+    async with batch_env.factory() as session:
+        assert await session.scalar(select(func.count()).select_from(McpPanelSyncAttempt).where(
+            McpPanelSyncAttempt.state == "processing")) == 0
+    batch_env.checked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_original_dispatch_finishing_late_does_not_overwrite_repaired_state(batch_env):
+    ids = await failed_panel_operations(batch_env, ["reject"])
+    async with batch_env.factory() as session:
+        (await session.get(McpModerationAction, ids[0])).telegram_sync_state = "pending"
+        await session.commit()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def late_failure(*args, **kwargs):
+        started.set()
+        await release.wait()
+        raise TimeoutError("late original timeout")
+
+    batch_env.checked.side_effect = late_failure
+    original_task = asyncio.create_task(batch_env.service._sync_legacy_panel(ids[0], "reject"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        # The dispatch timestamp must have been refreshed even though pending was old.
+        repair = McpPanelResyncService(batch_env.service)
+        fresh = await repair.resync_batch(batch_id="late", operation_ids=ids, dry_run=False, user_confirmed=True)
+        assert fresh["retry_after_seconds"] == 600
+        batch_env.now[0] += timedelta(seconds=601)
+        batch_env.checked.side_effect = None
+        repaired = await repair.resync_batch(batch_id="late", operation_ids=ids, dry_run=False, user_confirmed=True)
+        assert repaired["outcomes"] == {"verified": 1}
+    finally:
+        release.set()
+        final = await original_task
+    assert final["telegram_sync_state"] == "verified"

@@ -53,6 +53,30 @@ class McpModerationAction(EditorialBase, BaseIdMixin):
     telegram_sync_state: Mapped[str] = mapped_column(String(24), nullable=False, default="not_required")
 
 
+class McpPanelSyncAttempt(EditorialBase, BaseIdMixin):
+    """Card-only retry audit; never represents another moderation decision."""
+
+    __tablename__ = "mcp_panel_sync_attempts"
+    __table_args__ = (
+        UniqueConstraint("request_id"),
+        Index("ix_mcp_panel_sync_channel_window", "channel_id", "rate_limit_at"),
+    )
+
+    request_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    batch_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    operation_id: Mapped[int] = mapped_column(
+        ForeignKey("mcp_moderation_actions.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    claim_token: Mapped[str] = mapped_column(String(36), nullable=False)
+    legacy_sync_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_text: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rate_limit_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class McpModerationSnapshot(EditorialBase):
     __tablename__ = "mcp_moderation_snapshots"
 
