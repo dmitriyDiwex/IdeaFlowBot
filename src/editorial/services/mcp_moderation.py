@@ -26,6 +26,9 @@ from src.editorial.models.submission import Submission
 from src.editorial.services.legacy_audit import LEGACY_DELAYED_AUDIT_TEMPLATE_KEY
 from src.editorial.services.moderation import ModerationService
 from src.editorial.services.moderation_case_service import MODERATION_REJECTED, ModerationCaseService
+from src.editorial.services.telegram_resilience import (
+    is_transient_telegram_error, telegram_retry_after_seconds, run_telegram_operation,
+)
 
 
 MCP_MODERATION_SOURCE = "mcp_codex"
@@ -358,7 +361,7 @@ class McpModerationService:
 
     async def _apply_one(
         self, *, request_id: str, batch_id: str, action: ModerationRequest,
-        dry_run: bool, expected_members: list[dict] | None = None,
+        dry_run: bool, expected_members: list[dict] | None = None, defer_telegram: bool = False,
     ) -> dict[str, object]:
         # SQLite does not implement FOR UPDATE. Tests serialize only this local backend.
         async with self.session_maker() as session:
@@ -372,10 +375,12 @@ class McpModerationService:
                 return await self._apply_one_locked(
                     request_id=request_id, batch_id=batch_id, action=action,
                     dry_run=dry_run, expected_members=expected_members,
+                    defer_telegram=defer_telegram,
                 )
         return await self._apply_one_locked(
             request_id=request_id, batch_id=batch_id, action=action,
             dry_run=dry_run, expected_members=expected_members,
+            defer_telegram=defer_telegram,
         )
 
     async def _apply_one_locked(
@@ -386,6 +391,7 @@ class McpModerationService:
         action: ModerationRequest,
         dry_run: bool,
         expected_members: list[dict] | None = None,
+        defer_telegram: bool = False,
     ) -> dict[str, object]:
         async with self.session_maker() as session:
             existing = await session.scalar(
@@ -394,7 +400,7 @@ class McpModerationService:
             if existing is not None:
                 if not self._operation_matches(existing, action, dry_run):
                     return self._request_conflict_payload(existing, action)
-                if existing.outcome == "applied" and existing.telegram_sync_state == "pending":
+                if not defer_telegram and existing.outcome == "applied" and existing.telegram_sync_state == "pending":
                     return await self._sync_legacy_panel(existing.id, existing.decision)
                 return self._operation_payload(existing, replayed=True)
 
@@ -528,7 +534,7 @@ class McpModerationService:
                     error_text=str(exc),
                 )
 
-        if action.decision in {MCP_APPROVE, MCP_REJECT, MCP_ADVERTISING}:
+        if not defer_telegram and action.decision in {MCP_APPROVE, MCP_REJECT, MCP_ADVERTISING}:
             return await self._sync_legacy_panel(operation.id, action.decision)
         return self._operation_payload(operation)
 
@@ -635,7 +641,7 @@ class McpModerationService:
         await session.flush()
         return None
 
-    async def _sync_legacy_panel(self, operation_id: int, decision: str) -> dict[str, object]:
+    async def _sync_legacy_panel(self, operation_id: int, decision: str, *, guarded: bool = False) -> dict[str, object]:
         # Claim before any external send. A crash after dispatch is visible and never
         # blindly resends an advertising response.
         async with self.session_maker() as session:
@@ -649,29 +655,82 @@ class McpModerationService:
             operation.telegram_sync_state = "dispatching"
             # A resumed pending dispatch starts now, not at the old DB decision time.
             operation.rate_limit_at = await self._now(session)
+            if guarded:
+                operation.dispatch_deadline_at = operation.rate_limit_at + timedelta(
+                    seconds=settings.telegram_request_timeout_seconds + settings.mcp_card_timeout_seconds + 5,
+                )
+            send_advertising = decision == MCP_ADVERTISING and operation.advertising_reply_state == "pending"
+            if send_advertising:
+                operation.advertising_reply_state = "dispatching"
             await session.commit()
             submission_id = operation.submission_id
         warning = None
         sync_count = 0
-        try:
-            from src.editorial.services.telegram_actions import TelegramEditorialActions
+        ad_state = operation.advertising_reply_state
+        ad_warning = operation.advertising_warning_text
+        transient = False
+        retry_after = 0
 
+        async def dispatch():
+            nonlocal sync_count, warning, ad_state, ad_warning, transient, retry_after
+            from src.editorial.services.telegram_actions import TelegramEditorialActions
+            actions = TelegramEditorialActions()
+            if send_advertising:
+                try:
+                    await run_telegram_operation(
+                        actions.send_submission_advertising_reply_v2(submission_id, strict=True),
+                        operation="advertising flow",
+                    )
+                    ad_state = "sent"
+                except Exception as exc:
+                    # A timeout may follow a successful send. Never send it again.
+                    ad_state = "sent" if "Advertising reply sent, but manager" in str(exc) else "uncertain"
+                    ad_warning = self._truncate(str(exc), 1000)
+            try:
+                sync_count = await run_telegram_operation(
+                    actions.legacy_moderation_sync.sync_panel_submission_agent_checked(submission_id, decision=decision),
+                    operation="moderation card", timeout_seconds=settings.mcp_card_timeout_seconds,
+                )
+                if sync_count < 1:
+                    raise ValueError("No Telegram moderation cards were synchronized")
+            except Exception as exc:
+                warning = f"Moderation was applied, but Telegram synchronization failed: {exc}"
+                transient = getattr(exc, "transient", is_transient_telegram_error(exc))
+                retry_after = telegram_retry_after_seconds(exc) or 0
+        try:
             async with self.session_maker() as session:
+                if guarded:
+                    # The background worker keeps the same protection as safe card
+                    # recovery: humans cannot overtake an in-flight bounded edit.
+                    await session.scalar(select(Channel).where(Channel.id == operation.channel_id).with_for_update())
                 submission = await session.get(Submission, submission_id)
                 if submission is None:
                     raise ValueError("Submission missing before Telegram synchronization")
-                related = await self.moderation.get_related_submissions(session, submission)
+                related = await self.moderation.get_related_submissions(session, submission, lock=guarded)
                 if (any(self._status_value(item.status) != operation.resulting_status for item in related)
                         or await self._human_decided(session, related)):
                     raise ValueError("Human decision or status change before Telegram synchronization")
-            actions = TelegramEditorialActions()
-            if decision == MCP_ADVERTISING:
-                await actions.send_submission_advertising_reply_v2(submission_id, strict=True)
-            sync_count = await actions.legacy_moderation_sync.sync_panel_submission_agent_checked(
-                submission_id, decision=decision,
-            )
+                if guarded:
+                    await dispatch()
+            if not guarded:
+                await dispatch()
         except Exception as exc:
             warning = f"Moderation was applied, but Telegram synchronization failed: {exc}"
+            transient = is_transient_telegram_error(exc)
+            retry_after = telegram_retry_after_seconds(exc) or 0
+        except asyncio.CancelledError:
+            # The durable job can recover a card; an advertising send stays uncertain.
+            async with self.session_maker() as session:
+                current = await session.get(McpModerationAction, operation_id)
+                if current.telegram_sync_state == "dispatching":
+                    current.telegram_sync_state = "warning"
+                    current.telegram_error_transient = True
+                    current.warning_text = "Telegram dispatch was cancelled; card-only retry is safe"
+                    if send_advertising:
+                        current.advertising_reply_state = "uncertain"
+                        current.advertising_warning_text = "Advertising dispatch cancelled; delivery is unconfirmed"
+                    await session.commit()
+            raise
 
         async with self.session_maker() as session:
             operation = await session.scalar(
@@ -681,8 +740,12 @@ class McpModerationService:
             if operation.telegram_sync_state != "dispatching":
                 return self._operation_payload(operation, replayed=True)
             operation.legacy_sync_count = sync_count
-            operation.warning_text = self._truncate(warning, 4000) if warning else None
+            operation.advertising_reply_state = ad_state
+            operation.advertising_warning_text = ad_warning
+            operation.warning_text = self._truncate(warning or ad_warning, 4000) if warning or ad_warning else None
             operation.telegram_sync_state = "warning" if warning else "verified"
+            operation.telegram_error_transient = transient
+            operation.telegram_retry_after_seconds = retry_after
             # Conservative sliding window includes the completion of Telegram work.
             operation.rate_limit_at = await self._now(session)
             await session.commit()
@@ -864,6 +927,7 @@ class McpModerationService:
             error_text=error_text,
             created_at=now,
             telegram_sync_state="not_required",
+            advertising_reply_state="pending" if action.decision == MCP_ADVERTISING and not dry_run else "not_required",
             completed_at=now if outcome != "processing" else None,
         )
 
@@ -988,6 +1052,10 @@ class McpModerationService:
             "content_item_id": operation.content_item_id,
             "legacy_sync_count": operation.legacy_sync_count,
             "telegram_sync_state": operation.telegram_sync_state,
+            "advertising_reply_state": operation.advertising_reply_state,
+            "advertising_warning": operation.advertising_warning_text,
+            "telegram_error_transient": operation.telegram_error_transient,
+            "telegram_retry_after_seconds": operation.telegram_retry_after_seconds,
             "warning": operation.warning_text,
             "error": operation.error_text,
             "created_at": operation.created_at.isoformat(),

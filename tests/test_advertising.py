@@ -108,8 +108,7 @@ async def test_advertising_manager_change_sends_by_id_without_username_error(
     )
     alert_bot.send_message.assert_awaited_once()
     assert alert_bot.send_message.await_args.kwargs["chat_id"] == 9001
-    if strict:
-        alert_bot.close_session.assert_awaited_once()
+    alert_bot.close_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -164,4 +163,4 @@ async def test_strict_advertising_reports_real_manager_failure_with_chat_id(monk
 
     source_bot.send_message.assert_awaited_once()
     alert_bot.send_message.assert_awaited_once()
-    alert_bot.close_session.assert_awaited_once()
+    alert_bot.close_session.assert_not_awaited()

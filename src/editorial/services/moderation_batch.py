@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta, timezone
+import hashlib
 import uuid
 
 from sqlalchemy import String, and_, case, cast, func, literal, or_, select
@@ -8,7 +9,7 @@ from sqlalchemy.orm import aliased
 
 from src.editorial.config import settings
 from src.editorial.models.channel import Channel
-from src.editorial.models.mcp_moderation import McpModerationAction, McpModerationSnapshot
+from src.editorial.models.mcp_moderation import McpModerationAction, McpModerationSnapshot, McpModerationJob
 from src.editorial.models.moderation_case import ModerationCase
 from src.editorial.models.submission import Submission
 from src.editorial.models.enums import SubmissionStatus
@@ -29,6 +30,12 @@ REASON_CODES = {
     "minor_sexual": "Сексуальный контент с несовершеннолетними",
     "media_review": "Требуется просмотр медиа",
     "manual_review": "Неоднозначный случай",
+    "user_override": "Явное решение пользователя для этой строки",
+    "missing_context": "Недостаточно контекста",
+    "spam": "Массовая повторяющаяся рассылка",
+    "restricted_goods": "Продвижение ограниченных товаров",
+    "sexual_violence": "Сексуальное насилие или откровенный нежелательный контент",
+    "self_harm_encouragement": "Опасный призыв навредить себе",
 }
 PROFILE = "student_default_v1"
 MSK = timezone(timedelta(hours=3))
@@ -132,7 +139,7 @@ class ModerationBatchService(McpModerationService):
         ).subquery()
 
     async def list_pending_summary(self, *, profile=PROFILE, include_hold=False, media="exclude",
-                                   include_media_count=False, include_hold_count=False):
+                                   include_media_count=False, include_hold_count=False, include_queues=True):
         self._validate_profile(profile, media)
         groups = self._groups("include" if media == "include" or include_media_count or include_hold_count else "exclude")
         async with self.session_maker() as session:
@@ -164,17 +171,25 @@ class ModerationBatchService(McpModerationService):
             result["excluded_media_count"] = media_count if media == "exclude" else 0
         if include_hold_count:
             result["hold_count"] = hold_count
+        result.update(self.profile_metadata())
+        if not include_queues:
+            result.pop("queues")
         return result
 
+    def profile_metadata(self):
+        names = sorted(set(self.excluded_bots))
+        return {"excluded_bots_count": len(names), "exclusions_sha256": hashlib.sha256(
+            "\n".join(names).encode()).hexdigest()}
+
     async def prepare_moderation_batch(self, *, profile=PROFILE, limit=100, order="oldest",
-                                       media="exclude", text_limit=300, include_hold=False):
+                                       media="exclude", text_limit=300, include_hold=False, compact=False, count_media=True):
         self._validate_profile(profile, media)
         if order not in {"oldest", "newest"}:
             raise ValueError("order must be oldest or newest")
         if not 1 <= limit <= settings.mcp_snapshot_max_size or not 1 <= text_limit <= 300:
             raise ValueError("limit must be within snapshot maximum; text_limit must be 1-300")
         groups = self._groups(media)
-        media_groups = self._groups() if media == "exclude" else groups
+        media_groups = self._groups() if media == "exclude" and count_media else groups
         status_filter = groups.c.status.in_(["new", "hold"] if include_hold else ["new"])
         ordering = groups.c.submitted_at.asc() if order == "oldest" else groups.c.submitted_at.desc()
         stmt = select(groups).where(status_filter)
@@ -186,7 +201,7 @@ class ModerationBatchService(McpModerationService):
             skipped_media = await session.scalar(select(func.count()).select_from(media_groups).where(
                 media_groups.c.status.in_(["new", "hold"] if include_hold else ["new"]),
                 media_groups.c.has_media == 1,
-            )) if media == "exclude" else 0
+            )) if media == "exclude" and count_media else None
             selected_ids = [row.id for row in selected]
             canonical = list((await session.execute(
                 select(Submission).where(Submission.id.in_(selected_ids)),
@@ -231,6 +246,8 @@ class ModerationBatchService(McpModerationService):
                     "text_preview": self._truncate(text.strip(), text_limit),
                     "duplicate": duplicates.get(item.id), "relevant_history": history,
                 }
+                if len(text.strip()) > text_limit:
+                    public["text_truncated"] = True
                 if selected_row.has_media:
                     public["requires_human_media_review"] = True
                     public["media_item_count"] = len(related)
@@ -244,11 +261,11 @@ class ModerationBatchService(McpModerationService):
                 expires_at=now + timedelta(hours=settings.mcp_snapshot_ttl_hours),
                 profile=profile, policy_version=self.policy.version, policy_sha256=self.policy.sha256,
                 rows=stored, state="awaiting_approval", proposals=[], user_changes=[], decisions=[],
-                summary={"skipped_media_count": int(skipped_media)},
+                summary={"skipped_media_count": int(skipped_media) if skipped_media is not None else None},
             )
             session.add(snapshot)
             await session.commit()
-            return self._snapshot_payload(snapshot)
+            return {**self._snapshot_payload(snapshot, compact=compact), **self.profile_metadata()}
 
     async def _context(self, session, items):
         hashes = {item.text_hash for item in items if item.text_hash}
@@ -310,10 +327,112 @@ class ModerationBatchService(McpModerationService):
             ]
         return duplicates, histories
 
-    async def get_moderation_batch(self, snapshot_id):
+    async def get_moderation_batch(self, snapshot_id, *, compact=False):
         async with self.session_maker() as session:
             snapshot = await self._snapshot(session, snapshot_id)
-            return self._snapshot_payload(snapshot)
+            return self._snapshot_payload(snapshot, compact=compact)
+
+    async def get_moderation_message(self, snapshot_id, row):
+        async with self.session_maker() as session:
+            snapshot = await self._snapshot(session, snapshot_id)
+            selected = next((entry for entry in snapshot.rows if entry["public"]["row"] == row), None)
+            if selected is None:
+                raise ValueError("Unknown snapshot row")
+            submission_id = selected["public"]["submission_id"]
+        message = await self.get_submission(submission_id)
+        return {"snapshot_id": snapshot_id, "row": row, "status": message["status"],
+                "channel": selected["public"]["channel"], "untrusted_text": message["untrusted_text"],
+                "requires_human_media_review": message["requires_human_media_review"]}
+
+    async def enqueue_moderation_batch(self, *, snapshot_id, decisions=None, user_changes=None,
+                                       rows=None, user_confirmed=False):
+        """Confirm once, persist intent atomically, return immediately; no Telegram I/O."""
+        if not user_confirmed or not self.write_enabled:
+            raise PermissionError("Explicit user confirmation and MCP writes enabled are required")
+        async with self.session_maker() as session:
+            snapshot = await self._snapshot(session, snapshot_id, lock=True)
+            job = await session.scalar(select(McpModerationJob).where(
+                McpModerationJob.snapshot_id == snapshot_id,
+            ).with_for_update())
+            now = await self._now(session)
+            if snapshot.confirmed_at is None and (snapshot.state == "stale" or self._utc(snapshot.expires_at) <= now):
+                raise ValueError("Snapshot expired; prepare and show a new batch")
+            base = decisions if decisions is not None else (snapshot.decisions if snapshot.confirmed_at else snapshot.proposals)
+            selected = self._validate_decisions(snapshot, base or [])
+            # Preserve earlier user corrections saved with the draft; a later
+            # small override changes only its own row, not all previous edits.
+            saved_changes = {} if snapshot.confirmed_at else {
+                entry["row"]: entry for entry in snapshot.user_changes
+            }
+            saved_changes.update({entry["row"]: entry for entry in
+                                  self._validate_decisions(snapshot, user_changes or [])})
+            changes = self._validate_decisions(snapshot, list(saved_changes.values()))
+            merged = {entry["row"]: entry for entry in selected}
+            if any(entry["row"] not in merged for entry in changes):
+                raise ValueError("User change requires a proposed decision for that row")
+            merged.update({entry["row"]: entry for entry in changes})
+            selected = sorted(merged.values(), key=lambda entry: entry["row"])
+            if not selected:
+                raise ValueError("Save draft proposals or supply decisions before confirmation")
+            if snapshot.confirmed_at and selected != snapshot.decisions:
+                raise ValueError("Confirmed snapshot decisions are immutable")
+            authorized = sorted(merged) if rows is None else list(rows)
+            if (not authorized or any(type(row) is not int or row not in merged for row in authorized)
+                    or len(set(authorized)) != len(authorized)):
+                raise ValueError("rows must contain distinct proposed row numbers")
+            if snapshot.confirmed_at is None:
+                snapshot.decisions = selected
+                snapshot.proposals = snapshot.proposals or selected
+                proposed = {entry["row"]: entry for entry in snapshot.proposals}
+                snapshot.user_changes = [entry for entry in selected if proposed.get(entry["row"]) != entry]
+                snapshot.confirmed_at = now
+            if job is None:
+                snapshot.state = "applying"
+                job = McpModerationJob(snapshot_id=snapshot_id, state="queued", authorized_rows=sorted(authorized),
+                                       card_retries={}, next_run_at=now, created_at=now, updated_at=now)
+                session.add(job)
+            elif not set(authorized).issubset(job.authorized_rows):
+                snapshot.state = "applying"
+                job.authorized_rows = sorted(set(job.authorized_rows) | set(authorized))
+                if not job.lease_until or self._utc(job.lease_until) <= now:
+                    job.state = "queued"
+                job.next_run_at = now
+                job.updated_at = now
+            await session.commit()
+        return await self.get_moderation_batch_status(snapshot_id)
+
+    async def get_moderation_batch_status(self, snapshot_id, *, include_exceptions=False, exception_offset=0):
+        if type(exception_offset) is not int or exception_offset < 0:
+            raise ValueError("exception_offset must be a nonnegative integer")
+        async with self.session_maker() as session:
+            snapshot = await self._snapshot(session, snapshot_id)
+            job = await session.get(McpModerationJob, snapshot_id)
+            if job is None:
+                return {"snapshot_id": snapshot_id, "state": snapshot.state,
+                        "selected_count": len(snapshot.rows), "saved_proposals": len(snapshot.proposals),
+                        "user_confirmed": snapshot.confirmed_at is not None}
+            authorized = set(job.authorized_rows)
+            result = await self._final_summary(snapshot_id, {}, persist=False, selected_rows=authorized)
+            result["state"] = job.state
+            if job.state in {"completed", "completed_with_warnings"}:
+                has_warnings = (result["failed"] or result["conflicts"] or result["telegram_cards_pending"]
+                                or result["advertising_delivery_warnings"])
+                result["state"] = "completed_with_warnings" if has_warnings else "completed"
+            result["remaining_unconfirmed_rows"] = len(snapshot.rows) - len(authorized)
+            result["next_poll_seconds"] = 15 if job.state in {"queued", "running", "waiting"} else 0
+            result["worker_error"] = job.error_text
+            now = await self._now(session)
+            result["worker_stalled"] = (job.state in {"queued", "running", "waiting"}
+                                         and self._utc(job.next_run_at) < now
+                                         and (now-self._utc(job.updated_at)).total_seconds() > 120)
+            result["exception_count"] = len(result["exceptions"])
+            if include_exceptions:
+                result["exceptions"] = result["exceptions"][exception_offset:exception_offset+20]
+            else:
+                result["attention_rows"] = sorted({entry["row"] for entry in result.pop("exceptions")})[:20]
+            # Policy contents and long audit errors are not repeated during polling.
+            result.pop("policy", None)
+            return result
 
     async def save_moderation_batch_draft(self, *, snapshot_id, proposals, user_changes=None):
         async with self.session_maker() as session:
@@ -383,9 +502,9 @@ class ModerationBatchService(McpModerationService):
                 deferred[entry["row"]] = result["retry_after_seconds"]
         return await self._final_summary(snapshot_id, deferred)
 
-    async def _final_summary(self, snapshot_id, deferred):
+    async def _final_summary(self, snapshot_id, deferred, *, persist=True, selected_rows=None):
         async with self.session_maker() as session:
-            snapshot = await self._snapshot(session, snapshot_id, lock=True)
+            snapshot = await self._snapshot(session, snapshot_id, lock=persist)
             operations = list((await session.execute(select(McpModerationAction).where(
                 McpModerationAction.batch_id == f"snapshot-{snapshot_id}",
             ))).scalars())
@@ -395,13 +514,16 @@ class ModerationBatchService(McpModerationService):
             actual = {item.id: item for item in (await session.execute(select(Submission).where(
                 Submission.id.in_(ids),
             ))).scalars()}
+            decisions = [entry for entry in snapshot.decisions if selected_rows is None or entry["row"] in selected_rows]
             result = {
                 "snapshot_id": snapshot_id, **self._snapshot_policy(snapshot),
-                "requested": len(snapshot.decisions), "applied": 0, "conflicts": 0,
+                "requested": len(decisions), "applied": 0, "conflicts": 0,
                 "failed": 0, "skipped": 0, "pending": 0, "telegram_sync_warnings": 0,
                 "verified": 0, "exceptions": [],
+                "telegram_cards_verified": 0, "telegram_cards_pending": 0,
+                "advertising_delivery_warnings": [], "decision_counts": {},
             }
-            for decision in snapshot.decisions:
+            for decision in decisions:
                 row_number = decision["row"]
                 if decision["decision"] == "skip":
                     result["skipped"] += 1
@@ -416,28 +538,46 @@ class ModerationBatchService(McpModerationService):
                     if any(item is None or self._status_value(item.status) != operation.resulting_status for item in members):
                         result["failed"] += 1
                         result["applied"] -= 1
-                        result["exceptions"].append({"row": row_number, "type": "verification",
+                        result["exceptions"].append({"row": row_number, "operation_id": operation.id, "type": "verification",
                                                      "error": "Recorded result differs from current group status"})
                     else:
                         result["verified"] += 1
-                    if operation.warning_text or operation.telegram_sync_state not in {"verified", "not_required"}:
+                        value = decision["decision"]
+                        result["decision_counts"][value] = result["decision_counts"].get(value, 0) + 1
+                    if operation.telegram_sync_state == "verified":
+                        result["telegram_cards_verified"] += 1
+                    elif operation.telegram_sync_state != "not_required":
+                        result["telegram_cards_pending"] += 1
+                    ad_warning = operation.decision == "advertising" and (
+                        operation.advertising_reply_state != "sent" or operation.advertising_warning_text
+                    )
+                    if ad_warning:
+                        result["advertising_delivery_warnings"].append(row_number)
+                        result["exceptions"].append({
+                            "row": row_number, "operation_id": operation.id, "type": "advertising_delivery",
+                            "error": self._truncate(operation.advertising_warning_text, 240)
+                                     or "Advertising delivery is unknown; not automatically resent",
+                        })
+                    if operation.telegram_sync_state not in {"verified", "not_required"}:
                         result["telegram_sync_warnings"] += 1
                         result["exceptions"].append({
-                            "row": row_number, "type": "telegram_sync",
-                            "error": operation.warning_text or "Telegram dispatch is incomplete or uncertain; not automatically resent",
+                            "row": row_number, "operation_id": operation.id, "type": "telegram_sync",
+                            "error": self._truncate(operation.warning_text, 240)
+                                     or "Telegram card synchronization is incomplete",
                         })
                 elif operation.outcome == "skipped":
                     result["conflicts"] += 1
-                    result["exceptions"].append({"row": row_number, "type": "conflict", "error": operation.error_text})
+                    result["exceptions"].append({"row": row_number, "operation_id": operation.id, "type": "conflict", "error": operation.error_text})
                 else:
                     result["failed"] += 1
-                    result["exceptions"].append({"row": row_number, "type": "failed", "error": operation.error_text})
-            snapshot.state = "applying" if result["pending"] else "applied"
-            result["state"] = snapshot.state
+                    result["exceptions"].append({"row": row_number, "operation_id": operation.id, "type": "failed", "error": operation.error_text})
+            result["state"] = "applying" if result["pending"] else "applied"
             if result["pending"]:
                 result["retry_after_seconds"] = min(deferred.values()) if deferred else 1
-            snapshot.summary = {**result, "skipped_media_count": snapshot.summary.get("skipped_media_count", 0)}
-            await session.commit()
+            if persist:
+                snapshot.state = result["state"]
+                snapshot.summary = {**result, "skipped_media_count": snapshot.summary.get("skipped_media_count", 0)}
+                await session.commit()
             return result
 
     async def _snapshot(self, session, snapshot_id, lock=False):
@@ -459,7 +599,7 @@ class ModerationBatchService(McpModerationService):
             metadata["current_policy"] = self.policy.metadata()
         return metadata
 
-    def _snapshot_payload(self, snapshot):
+    def _snapshot_payload(self, snapshot, *, compact=False):
         result = {
             "snapshot_id": snapshot.snapshot_id, **self._snapshot_policy(snapshot),
             "profile": snapshot.profile, "state": snapshot.state,
@@ -471,6 +611,14 @@ class ModerationBatchService(McpModerationService):
         }
         if snapshot.confirmed_at is not None:
             result["application_summary"] = snapshot.summary
+        if compact:
+            result["rows"] = [{key: value for key, value in entry.items()
+                               if key != "submission_id" and value is not None and value != []}
+                              for entry in result["rows"]]
+            result.pop("proposals")
+            result.pop("user_changes")
+            if result.get("skipped_media_count") is None:
+                result.pop("skipped_media_count", None)
         return result
 
     @staticmethod

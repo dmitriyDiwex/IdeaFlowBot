@@ -13,6 +13,7 @@ from src.markups import (
     build_slot_status_markup,
 )
 from src.editorial.db.session import session_factory
+from src.editorial.config import settings
 from src.editorial.models.channel import Channel
 from src.editorial.models.content import ContentItem
 from src.editorial.models.enums import ContentItemStatus, PublicationStatus, ReviewDecision, SubmissionStatus
@@ -26,6 +27,18 @@ from src.editorial.services.legacy_audit import (
 from src.editorial.services.legacy_source import LegacyCollectorReader
 from src.editorial.services.moderation import ModerationService
 from src.editorial.services.moderation_case_service import ModerationCaseService
+from src.editorial.services.telegram_resilience import (
+    is_transient_telegram_error, telegram_retry_after_seconds,
+)
+
+
+class TelegramCardSyncError(ValueError):
+    def __init__(self, message, errors):
+        super().__init__(message)
+        self.transient = any(is_transient_telegram_error(error) for error in errors)
+        self.result_json = {"parameters": {"retry_after": max(
+            (telegram_retry_after_seconds(error) or 0 for error in errors), default=0,
+        )}}
 
 
 LEGACY_DELAYED_DELIVERY_CLAIM_MARKER = "Legacy delayed delivery claimed"
@@ -900,38 +913,40 @@ class LegacyModerationSyncService:
         bot = AsyncTeleBot(binding.bot_api_token)
         updated_count = 0
         errors = []
-        try:
-            for row in review_rows:
-                related_submission = submission_by_legacy_row_id.get(row.id)
-                markup = self._build_panel_status_markup(
-                    state=state,
-                    user_id=row.user_id or (related_submission.source_user_id if related_submission else None),
-                    username=row.username or (related_submission.username if related_submission else None),
-                    first_name=row.first_name or (related_submission.first_name if related_submission else None),
-                    moderator_label=moderator_label, allow_cancel=allow_cancel,
+        exceptions = []
+        for row in review_rows:
+            related_submission = submission_by_legacy_row_id.get(row.id)
+            markup = self._build_panel_status_markup(
+                state=state,
+                user_id=row.user_id or (related_submission.source_user_id if related_submission else None),
+                username=row.username or (related_submission.username if related_submission else None),
+                first_name=row.first_name or (related_submission.first_name if related_submission else None),
+                moderator_label=moderator_label, allow_cancel=allow_cancel,
+            )
+            try:
+                response = await bot.edit_message_reply_markup(
+                    chat_id=int(row.review_chat_id), message_id=int(row.review_message_id),
+                    reply_markup=markup,
+                    timeout=settings.mcp_card_timeout_seconds,
                 )
-                try:
-                    response = await bot.edit_message_reply_markup(
-                        chat_id=int(row.review_chat_id), message_id=int(row.review_message_id),
-                        reply_markup=markup,
-                    )
-                    if strict:
-                        actual_markup = getattr(response, "reply_markup", None)
-                        if actual_markup is None or actual_markup.to_dict() != markup.to_dict():
-                            raise ValueError("Telegram did not acknowledge the expected card markup")
+                if strict:
+                    actual_markup = getattr(response, "reply_markup", None)
+                    if actual_markup is None or actual_markup.to_dict() != markup.to_dict():
+                        raise ValueError("Telegram did not acknowledge the expected card markup")
+                updated_count += 1
+            except Exception as ex:
+                # Re-applying the same keyboard is Telegram's supported status check.
+                if "message is not modified" in str(ex).lower():
                     updated_count += 1
-                except Exception as ex:
-                    # Re-applying the same keyboard is Telegram's supported status check.
-                    if "message is not modified" in str(ex).lower():
-                        updated_count += 1
-                        continue
-                    errors.append(f"card {row.review_message_id}: {ex}")
-                    logger.error("Failed to sync panel moderation status '{}' to review message {} in chat {}: {}",
-                                 state, row.review_message_id, row.review_chat_id, ex)
-        finally:
-            await bot.close_session()
+                    continue
+                errors.append(f"card {row.review_message_id}: {ex}")
+                exceptions.append(ex)
+                logger.error("Failed to sync panel moderation status '{}' to review message {} in chat {}: {}",
+                             state, row.review_message_id, row.review_chat_id, ex)
         if strict and errors:
-            raise ValueError(f"Telegram cards verified {updated_count}/{len(review_rows)}; " + "; ".join(errors))
+            raise TelegramCardSyncError(
+                f"Telegram cards verified {updated_count}/{len(review_rows)}; " + "; ".join(errors), exceptions,
+            ) from exceptions[0]
         return updated_count
 
     @staticmethod

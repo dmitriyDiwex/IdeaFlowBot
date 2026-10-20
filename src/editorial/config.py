@@ -22,7 +22,18 @@ DEFAULT_MCP_EXCLUDED_BOTS = (
     "misisforever_bot,lovespolispb_bot,ranhigs_slushaet_bot,urfu_overhear_bot,"
     "spbgmtuu_bot,predloshka_moscow_poli_bot,guap_never_sleep_bot,rudn_slushaetbot,"
     "gorni_anon_bot,kfu_ovehear_bot,predloshka_mpei_bot,mephi_podsl_bot,lobach_unn_bot,"
-    "kosygin_bot,spbgti_predloga_bot,igmuni_bot,shtiglewiggle_bot,kubguniver_bot,mgtusluhi_bot"
+    "kosygin_bot,spbgti_predloga_bot,igmuni_bot,shtiglewiggle_bot,kubguniver_bot,mgtusluhi_bot,"
+    "spbuneslishno_bot,baumanzdes_bot,podslushano_gasy_bot,mgua_slushaetbot,mgmu_predloga_bot,"
+    "maislushaet_bot,spgyptd_anon_bot,moscow_ranhigs_bot,itmo_anon_bot,gercenaslux_bot,"
+    "predloshkamiitbot,mpgusegodnya_bot,pervomedik_bot,szgmushka_bot,polyteh_words_bot,"
+    "mgimoslushaet_bot,spbu_never_sleep_bot,psniu_podsl_bot,podslbelgubot,podsl_omsu_bot,"
+    "niuranepa_podslushka_bot,mgppuone_bot,dvfu_predl_bot,sfuniver_bot,nngasu_predl_bot,utmn_predloga_bot,"
+    "rsreu_overheard_bot,podslushano_mtusi_bot,predloshka_hsebot,urgups_predlozhka_bot,"
+    "predloshka_pgups_bot,predloshka_mfua_bot,bgtu_predlozhka_bot,mfti_slushaet_bot,uunit_overhear_bot,"
+    "confession_priznavashkispbu,confession_mpguadore,confession_lovespbgasu,"
+    "confession_lovemaimoscow,confession_lovemgua,confession_itmonepriznaetsa,"
+    "confession_loveranhigs,confession_loveptdshka,confession_lovemiit,confession_lovemgmu,"
+    "confession_lovemgtumoscow,confession_lovemgimo,confession_lovepavlovaa"
 )
 
 
@@ -50,7 +61,13 @@ class EditorialSettings:
         if name.strip()
     )
     mcp_snapshot_ttl_hours: int = max(1, _get_int("EDITORIAL_MCP_SNAPSHOT_TTL_HOURS", 24))
-    mcp_snapshot_max_size: int = max(1, min(100, _get_int("EDITORIAL_MCP_SNAPSHOT_MAX_SIZE", 100)))
+    mcp_snapshot_max_size: int = max(1, min(1000, _get_int("EDITORIAL_MCP_SNAPSHOT_MAX_SIZE", 300)))
+    mcp_worker_concurrency: int = max(1, min(16, _get_int("EDITORIAL_MCP_WORKER_CONCURRENCY", 4)))
+    mcp_worker_tick_seconds: int = max(1, _get_int("EDITORIAL_MCP_WORKER_TICK_SECONDS", 2))
+    mcp_worker_budget_seconds: int = max(1, min(60, _get_int("EDITORIAL_MCP_WORKER_BUDGET_SECONDS", 15)))
+    mcp_card_retry_attempts: int = max(1, min(20, _get_int("EDITORIAL_MCP_CARD_RETRY_ATTEMPTS", 6)))
+    mcp_card_retry_base_seconds: int = max(1, _get_int("EDITORIAL_MCP_CARD_RETRY_BASE_SECONDS", 5))
+    mcp_card_timeout_seconds: int = max(1, min(60, _get_int("EDITORIAL_MCP_CARD_TIMEOUT_SECONDS", 12)))
     legacy_import_batch_size: int = _get_int("EDITORIAL_IMPORT_BATCH_SIZE", 200)
     scheduler_window_minutes: int = _get_int("EDITORIAL_SCHEDULER_WINDOW_MINUTES", 15)
     scheduler_commit_batch_size: int = max(1, _get_int("EDITORIAL_SCHEDULER_COMMIT_BATCH_SIZE", 25))

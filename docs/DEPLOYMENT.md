@@ -19,6 +19,7 @@
 - `collector-bot` — старый Telegram collector
 - `editorial-api` — HTTP API для review/import/manual actions
 - `editorial-mcp` — защищённый MCP endpoint для модерации через Codex
+- `editorial-mcp-worker` — сохраняемая очередь подтверждённых решений и синхронизации Telegram
 - `editorial-importer` — переносит новые legacy сообщения в `submissions`
 - `editorial-auto-slots` — раз в минуту распределяет автопланирование каналов внутри 30-минутного окна
 - `editorial-scheduler` — раскладывает approved контент по слотам
@@ -27,6 +28,9 @@
 - `redis` — резерв под фоновые задачи и расширение системы
 
 ## 3. Почему Здесь Есть И SQLite, И PostgreSQL
+
+Обновление оптимизированной MCP-модерации, миграция `20261020_30` и запуск нового
+воркера описаны в [MCP_FAST_WORKFLOW.md](MCP_FAST_WORKFLOW.md).
 
 SQLite остаётся только для старого collector-слоя.
 

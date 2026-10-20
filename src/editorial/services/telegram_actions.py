@@ -896,19 +896,16 @@ class TelegramEditorialActions:
         except Exception:
             pass
 
-        try:
-            await send_advertising_flow(
-                bot=bot,
-                recipient_user_id=int(submission.source_user_id),
-                channel_label=channel_label,
-                source_text=submission.raw_text or submission.cleaned_text,
-                sender_username=submission.username,
-                sender_first_name=submission.first_name,
-                **({"strict": True} if strict else {}),
-            )
-        finally:
-            if strict:
-                await bot.close_session()
+        # The process lifespan, not an individual reply, owns the shared session.
+        await send_advertising_flow(
+            bot=bot,
+            recipient_user_id=int(submission.source_user_id),
+            channel_label=channel_label,
+            source_text=submission.raw_text or submission.cleaned_text,
+            sender_username=submission.username,
+            sender_first_name=submission.first_name,
+            **({"strict": True} if strict else {}),
+        )
 
     async def ban_submission_author(
         self,

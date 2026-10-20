@@ -121,19 +121,16 @@ async def send_advertising_flow(
     alert_bot = _build_advertising_alert_bot() or bot
 
     errors = []
-    try:
-        for target in targets:
-            try:
-                await alert_bot.send_message(
-                    chat_id=target,
-                    text=advertiser_message,
-                    parse_mode="HTML",
-                )
-            except Exception as ex:
-                logger.error("Failed to send advertising alert to {}: {}", target, ex)
-                errors.append(f"chat_id={target}: {ex}")
-    finally:
-        if strict and alert_bot is not bot:
-            await alert_bot.close_session()
+    # The process lifespan owns the shared session, including this alert bot.
+    for target in targets:
+        try:
+            await alert_bot.send_message(
+                chat_id=target,
+                text=advertiser_message,
+                parse_mode="HTML",
+            )
+        except Exception as ex:
+            logger.error("Failed to send advertising alert to {}: {}", target, ex)
+            errors.append(f"chat_id={target}: {ex}")
     if strict and errors:
         raise ValueError("Advertising reply sent, but manager notification failed: " + "; ".join(errors))

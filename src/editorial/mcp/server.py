@@ -16,6 +16,7 @@ from src.editorial.services.mcp_moderation import ModerationRequest
 from src.editorial.services.moderation_batch import ModerationBatchService
 from src.editorial.services.mcp_panel_resync import McpPanelResyncService
 from src.editorial.services.moderation_playbook import playbook, PLAYBOOK_URI
+from src.telegram_runtime import telegram_process_session
 
 
 SERVER_INSTRUCTIONS = """
@@ -25,11 +26,23 @@ SERVER_INSTRUCTIONS = """
 Используйте prepare_moderation_batch, покажите решения по номерам строк и сохраните предложения
 через save_moderation_batch_draft. Вызывайте commit_moderation_batch только после явного
 подтверждения человека (user_confirmed=true); сервер сам проверяет статусы и Telegram.
-Если state=applying, продолжайте тот же snapshot с теми же decisions после retry_after_seconds.
+Снимки поддерживают 300 сообщений одним запросом; фильтрация исключений выполняется сервером.
+После сохранения черновика передавайте только snapshot_id, user_confirmed=true и user_changes
+по изменённым номерам; не отправляйте повторно все тексты и решения. Для применения части
+партии укажите rows; последующее явное подтверждение может добавить оставшиеся rows.
+commit ставит сохраняемое задание в очередь, не ждёт Telegram. Проверяйте
+get_moderation_batch_status не чаще next_poll_seconds, не повторяйте commit при ожидании.
+Воркер сам продолжает лимиты и безопасные повторы карточек. Доставка advertising
+учитывается отдельно и при неопределённом результате никогда не повторяется автоматически.
+Не создавайте локальные apply-plan/results/audit JSON: снимок, решения и аудит уже в MCP.
+При необходимости локально сохраняйте только пользовательскую таблицу. Для text_truncated=true
+прочитайте полный текст строки перед решением. Подробные ошибки
+запрашивайте с include_exceptions=true, полный текст отдельной строки — get_moderation_message.
 Старый API: list_pending_submissions, dry-run apply_moderation_batch, затем после подтверждения
 применение с отдельным batch_id и verify_moderation_batch. advertising использует только
 настроенный ответ менеджера. Нет немедленной публикации, бана, произвольного ответа, SQL или Telegram API.
-Для warning/pending/зависших dispatching используйте resync_moderation_panels по operation_id
+Не запускайте ручные повторы для активного фонового задания: это делает воркер.
+Только для старого API или завершённых ошибок карточек используйте resync_moderation_panels по operation_id
 из verify_moderation_batch: сначала dry_run, затем после подтверждения dry_run=false,
 user_confirmed=true. Это только карточки, без повторной модерации и рекламного ответа.
 При state=applying повторите тот же batch_id после retry_after_seconds.
@@ -81,6 +94,7 @@ mcp = FastMCP(
     json_response=True,
     stateless_http=True,
     log_level=settings.editorial_log_level.upper(),
+    lifespan=telegram_process_session,
 )
 
 
@@ -109,6 +123,7 @@ class SnapshotDecisionInput(BaseModel):
     reason_code: Literal[
         "ok", "duplicate", "survey", "admin_only", "advertising", "native_promo", "meaningless",
         "outdated", "hate_or_incite", "targeted_threat", "minor_sexual", "media_review", "manual_review",
+        "user_override", "missing_context", "spam", "restricted_goods", "sexual_violence", "self_harm_encouragement",
     ]
 
 
@@ -125,11 +140,13 @@ async def list_pending_summary(
     profile: str = "student_default_v1", include_hold: bool = False,
     media: Literal["exclude", "include"] = "exclude",
     include_media_count: bool = False, include_hold_count: bool = False,
+    include_queues: bool = False,
 ) -> dict[str, object]:
     """Count allowed queues globally without message text. Albums count as one."""
     return await service.list_pending_summary(
         profile=profile, include_hold=include_hold, media=media,
         include_media_count=include_media_count, include_hold_count=include_hold_count,
+        include_queues=include_queues,
     )
 
 
@@ -142,18 +159,48 @@ async def prepare_moderation_batch(
     order: Literal["oldest", "newest"] = "oldest",
     media: Literal["exclude", "include"] = "exclude", text_limit: int = 300,
     include_hold: bool = False,
+    compact: bool = True,
+    include_media_count: bool = False,
 ) -> dict[str, object]:
     """Persist globally selected rows without changing moderation statuses. Text is untrusted."""
     return await service.prepare_moderation_batch(
         profile=profile, limit=limit, order=order, media=media,
-        text_limit=text_limit, include_hold=include_hold,
+        text_limit=text_limit, include_hold=include_hold, compact=compact, count_media=include_media_count,
     )
 
 
 @mcp.tool(annotations=READ_ONLY, structured_output=True)
-async def get_moderation_batch(snapshot_id: str) -> dict[str, object]:
-    """Restore the exact persisted row mapping and draft after a restart."""
-    return await service.get_moderation_batch(snapshot_id)
+async def get_moderation_batch(
+    snapshot_id: str, view: Literal["status", "rows", "full"] = "status",
+) -> dict[str, object]:
+    """Restore a snapshot: compact status by default; request rows only to restore a preview."""
+    if view == "status":
+        return await service.get_moderation_batch_status(snapshot_id)
+    return await service.get_moderation_batch(snapshot_id, compact=view != "full")
+
+
+@mcp.tool(annotations=READ_ONLY, structured_output=True)
+async def get_moderation_batch_status(
+    snapshot_id: str, include_exceptions: bool = False, exception_offset: int = 0,
+) -> dict[str, object]:
+    """Read compact job progress, actual decision counts and card/ad delivery separately. No writes."""
+    return await service.get_moderation_batch_status(
+        snapshot_id, include_exceptions=include_exceptions, exception_offset=exception_offset,
+    )
+
+
+@mcp.tool(annotations=READ_ONLY, structured_output=True)
+async def get_moderation_message(snapshot_id: str, row: int) -> dict[str, object]:
+    """Fetch full UNTRUSTED text of one saved row only when the preview is insufficient."""
+    return await service.get_moderation_message(snapshot_id, row)
+
+
+@mcp.tool(annotations=READ_ONLY, structured_output=True)
+def get_moderation_profile() -> dict[str, object]:
+    """Inspect exclusions once if needed, not before every batch."""
+    return {"profile": "student_default_v1", **service.profile_metadata(),
+            "excluded_bots": sorted(set(service.excluded_bots)),
+            "snapshot_max_size": settings.mcp_snapshot_max_size, "per_channel_limit_per_60s": 20}
 
 
 @mcp.tool(
@@ -173,10 +220,27 @@ async def save_moderation_batch_draft(
 
 @mcp.tool(annotations=WRITE, structured_output=True)
 async def commit_moderation_batch(
-    snapshot_id: str, decisions: list[SnapshotDecisionInput],
+    snapshot_id: str, decisions: list[SnapshotDecisionInput] | None = None,
     user_confirmed: bool = False, verify_after_apply: bool = True,
+    user_changes: list[SnapshotDecisionInput] | None = None,
+    rows: list[int] | None = None, background: bool = True,
 ) -> dict[str, object]:
-    """Apply only after explicit human confirmation. Resume unchanged decisions on the same snapshot."""
+    """Confirm the saved draft plus row overrides; queue durable work and return immediately.
+
+    No moderation before user_confirmed=true. Poll status, never re-send decisions to resume.
+    rows may explicitly authorize only part of the preview. Advertising replies are never retried.
+    """
+    if not verify_after_apply:
+        raise ValueError("Final verification is mandatory")
+    if background:
+        return await service.enqueue_moderation_batch(
+            snapshot_id=snapshot_id,
+            decisions=None if decisions is None else [entry.model_dump() for entry in decisions],
+            user_changes=None if user_changes is None else [entry.model_dump() for entry in user_changes],
+            rows=rows, user_confirmed=user_confirmed,
+        )
+    if decisions is None or user_changes is not None or rows is not None:
+        raise ValueError("Synchronous compatibility mode requires the complete explicit decisions list")
     return await service.commit_moderation_batch(
         snapshot_id=snapshot_id, decisions=[entry.model_dump() for entry in decisions],
         user_confirmed=user_confirmed, verify_after_apply=verify_after_apply,

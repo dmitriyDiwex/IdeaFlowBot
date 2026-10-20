@@ -51,6 +51,11 @@ class McpModerationAction(EditorialBase, BaseIdMixin):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     rate_limit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_sync_state: Mapped[str] = mapped_column(String(24), nullable=False, default="not_required")
+    advertising_reply_state: Mapped[str] = mapped_column(String(24), nullable=False, default="not_required")
+    advertising_warning_text: Mapped[str | None] = mapped_column(Text)
+    telegram_error_transient: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    telegram_retry_after_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatch_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class McpPanelSyncAttempt(EditorialBase, BaseIdMixin):
@@ -94,3 +99,23 @@ class McpModerationSnapshot(EditorialBase):
     decisions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class McpModerationJob(EditorialBase):
+    """Durable, explicitly authorized work; survives MCP/client/worker restarts."""
+
+    __tablename__ = "mcp_moderation_jobs"
+    __table_args__ = (Index("ix_mcp_jobs_due", "state", "next_run_at"),)
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_moderation_snapshots.snapshot_id", ondelete="CASCADE"), primary_key=True,
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    authorized_rows: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    card_retries: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_token: Mapped[str | None] = mapped_column(String(36))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    error_text: Mapped[str | None] = mapped_column(Text)

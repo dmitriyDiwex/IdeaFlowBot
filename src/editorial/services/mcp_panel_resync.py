@@ -12,6 +12,7 @@ from src.editorial.models.channel import Channel
 from src.editorial.models.mcp_moderation import McpModerationAction, McpPanelSyncAttempt
 from src.editorial.models.submission import Submission
 from src.editorial.services.mcp_moderation import BATCH_ID_PATTERN, _LOCAL_CHANNEL_LOCKS
+from src.editorial.services.telegram_resilience import is_transient_telegram_error, telegram_retry_after_seconds
 
 
 class McpPanelResyncService:
@@ -122,7 +123,9 @@ class McpPanelResyncService:
 
             if operation.telegram_sync_state == "dispatching":
                 started = operation.rate_limit_at or operation.completed_at or operation.created_at
-                remaining = self.ORIGINAL_DISPATCH_GRACE_SECONDS - (now - owner._utc(started)).total_seconds()
+                remaining = ((owner._utc(operation.dispatch_deadline_at) - now).total_seconds()
+                             if operation.dispatch_deadline_at else
+                             self.ORIGINAL_DISPATCH_GRACE_SECONDS - (now - owner._utc(started)).total_seconds())
                 if remaining > 0:
                     return self._result(operation_id, "deferred", "Original dispatch may still be running",
                                         retry=math.ceil(remaining))
@@ -222,9 +225,13 @@ class McpPanelResyncService:
                     attempt.state = "verified"
                     operation.legacy_sync_count = count
                     operation.telegram_sync_state = "verified"
+                    operation.telegram_error_transient = False
+                    operation.telegram_retry_after_seconds = 0
                     # A card retry cannot confirm delivery of an advertising reply.
                     if operation.decision != "advertising":
                         operation.warning_text = None
+                    elif operation.advertising_warning_text:
+                        operation.warning_text = operation.advertising_warning_text
                 except Exception as exc:
                     attempt.state = "warning"
                     attempt.error_text = owner._truncate(
@@ -232,6 +239,8 @@ class McpPanelResyncService:
                     )
                     operation.telegram_sync_state = "warning"
                     operation.warning_text = attempt.error_text
+                    operation.telegram_error_transient = getattr(exc, "transient", is_transient_telegram_error(exc))
+                    operation.telegram_retry_after_seconds = telegram_retry_after_seconds(exc) or 0
             attempt.completed_at = await owner._now(session)
             # Includes completion, just like original moderation, in the rolling limit.
             attempt.rate_limit_at = attempt.completed_at

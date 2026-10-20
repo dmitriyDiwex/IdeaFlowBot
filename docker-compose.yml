@@ -90,6 +90,21 @@ services:
       timeout: 7s
       retries: 5
 
+  editorial-mcp-worker:
+    image: ideaflowbot-app:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python -m src.editorial.services.moderation_worker
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      editorial-migrate:
+        condition: service_completed_successfully
+
   editorial-importer:
     image: ideaflowbot-app:local
     restart: unless-stopped
